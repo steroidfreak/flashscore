@@ -61,6 +61,10 @@ SIMILARITY_THRESHOLD: float = float(os.getenv("SIMILARITY_THRESHOLD", "0.75"))
 # Minimum per-side score – both home AND away must exceed this floor
 MIN_SIDE_SCORE: float       = float(os.getenv("MIN_SIDE_SCORE", "0.60"))
 
+# Run browser without a visible window.
+# MUST be True on a headless VPS (no display); False for local debugging.
+HEADLESS: bool = os.getenv("HEADLESS", "true").lower() in ("1", "true", "yes")
+
 # Tennis live page URL
 TENNIS_URL: str = "https://sports.dafabet.com/en/live/sport/239-TENN"
 
@@ -433,8 +437,9 @@ async def main() -> None:
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
-            headless=False,   # set True to hide the browser window
-            slow_mo=60,
+            headless=HEADLESS,
+            slow_mo=0 if HEADLESS else 60,   # no artificial delay needed on VPS
+            args=["--no-sandbox", "--disable-dev-shm-usage"] if HEADLESS else [],
         )
         context = await browser.new_context(
             user_agent=(
