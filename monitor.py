@@ -11,29 +11,48 @@ listed twice with slightly different player name formats, e.g.:
   Match B: "Butvilas, E vs Imamura, M"
 
 Name formats observed on the site:
-  • "Lastname, Firstname"          (full name,   singles)
-  • "Lastname, F"                  (initial only, singles)
-  • "Lastname F"                   (no comma,     singles – e.g. "Shimizu Y")
-  • "Lastname1, F1/Lastname2, F2"  (doubles pair, slash-separated)
+  • "Lastname, Firstname"              (full name,   singles)
+  • "Lastname, F"                      (initial only, singles)
+  • "Lastname, F M"                    (initial + middle initial, comma)
+  • "Lastname F"                       (no comma, singles – e.g. "Shimizu Y")
+  • "Lastname F M"                     (no comma, first + middle initial – e.g. "Romios M C")
+  • "Lastname Firstname M"             (no comma, full first + middle initial)
+  • "Lastname1, F1/Lastname2, F2"      (doubles pair, slash no spaces)
+  • "Lastname1 F1 / Lastname2 F2"      (doubles pair, slash with spaces)
 
 The matching model compares every live match pair and alerts via Telegram
 when the similarity score exceeds SIMILARITY_THRESHOLD.
 
 Quick-start
 -----------
-1. cp .env.example .env   # fill in your Telegram credentials
+1. cp .env.example .env   # fill in credentials (Telegram + Anthropic)
 2. pip install -r requirements.txt
 3. playwright install chromium
 4. python monitor.py
+
+Required .env keys:
+  TELEGRAM_BOT_TOKEN   – Telegram bot token
+  TELEGRAM_CHAT_ID     – Telegram chat/group ID
+  ANTHROPIC_API_KEY    – Anthropic API key (enables Claude Opus 4.6 analysis)
+
+Optional .env keys:
+  CHECK_INTERVAL       – seconds between polls (default: 60)
+  HEARTBEAT_INTERVAL   – seconds between heartbeat messages (default: 3600)
+  SIMILARITY_THRESHOLD – rule-based duplicate threshold (default: 0.75)
+  MIN_SIDE_SCORE       – rule-based per-side floor (default: 0.60)
+  HEADLESS             – run browser headless (default: true)
+  AI_ANALYSIS          – enable Claude Opus 4.6 analysis (default: true)
 """
 
 import asyncio
+import json
 import os
 import re
 import unicodedata
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 
+import anthropic
 import httpx
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Page
@@ -48,8 +67,8 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN: str   = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID:   str   = os.environ["TELEGRAM_CHAT_ID"]
 
-# Seconds between each poll of the tennis listing page
-CHECK_INTERVAL: int       = int(os.getenv("CHECK_INTERVAL", "10"))
+# Seconds between each poll of the tennis listing page (default 1 minute)
+CHECK_INTERVAL: int       = int(os.getenv("CHECK_INTERVAL", "60"))
 
 # Send a "still alive" heartbeat message every N seconds (default 1 hour)
 HEARTBEAT_INTERVAL: int   = int(os.getenv("HEARTBEAT_INTERVAL", "3600"))
@@ -64,6 +83,12 @@ MIN_SIDE_SCORE: float       = float(os.getenv("MIN_SIDE_SCORE", "0.60"))
 # Run browser without a visible window.
 # MUST be True on a headless VPS (no display); False for local debugging.
 HEADLESS: bool = os.getenv("HEADLESS", "true").lower() in ("1", "true", "yes")
+
+# Anthropic API key for AI-powered analysis (optional – falls back to rule-based only)
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+
+# Enable AI analysis using Claude Haiku 4.5 (requires ANTHROPIC_API_KEY)
+AI_ANALYSIS: bool = os.getenv("AI_ANALYSIS", "true").lower() in ("1", "true", "yes")
 
 # Tennis live page URL
 TENNIS_URL: str = "https://sports.dafabet.com/en/live/sport/239-TENN"
@@ -91,12 +116,17 @@ def parse_player(raw: str) -> dict:
       "Alcala Gurri, M"       → surname="alcala gurri", first="",  initial="m"
       "Mintegi del Olmo, A"   → surname="mintegi del olmo", initial="a"
       "Shimizu Y"             → surname="shimizu", initial="y"
+      "Romios M C"            → surname="romios",  initial="m"  (middle initial C ignored)
+      "Smith John C"          → surname="smith",   first="john", initial="j"
     """
     s = re.sub(r"\s+", " ", raw.strip())
     raw_lower = _ascii_lower(s)
+    first = ""
 
     if "," in s:
-        # "Surname[s], Firstname-or-Initial"
+        # "Surname[s], Firstname-or-Initial [MiddleInitial…]"
+        # Everything before the first comma is the (possibly compound) surname.
+        # Only the first token after the comma matters; trailing middle initials ignored.
         surname_part, rest = s.split(",", 1)
         surname = _ascii_lower(surname_part.strip())
         tokens = rest.strip().split()
@@ -104,30 +134,45 @@ def parse_player(raw: str) -> dict:
             tok0 = tokens[0].rstrip(".")
             if len(tok0) == 1:
                 initial = tok0.lower()
-                first   = ""
             else:
                 initial = tok0[0].lower()
                 first   = _ascii_lower(tok0)
         else:
-            initial = first = ""
+            initial = ""
     else:
-        # "Surname Initial"  or  "Surname Firstname"
+        # No-comma formats:
+        #   "Surname Initial"         – 2 tokens, last is 1 char  → "Shimizu Y"
+        #   "Surname M C"             – 3+ tokens, all trailing are initials → "Romios M C"
+        #   "Surname Firstname C"     – 3+ tokens, second is a full name → "Smith John C"
+        #   "Surname Firstname"       – 2 tokens, last is multi-char
         tokens = s.split()
         if len(tokens) >= 2:
             last_tok = tokens[-1].rstrip(".")
             if len(last_tok) == 1:
-                # Definitely an initial: "Shimizu Y"
-                initial = last_tok.lower()
-                first   = ""
-                surname = _ascii_lower(" ".join(tokens[:-1]))
+                # Trailing token is an initial.
+                # Surname is ALWAYS just the first token (never absorb middle initials).
+                surname = _ascii_lower(tokens[0])
+                if len(tokens) == 2:
+                    # "Shimizu Y" – simple case
+                    initial = last_tok.lower()
+                else:
+                    # 3+ tokens: "Romios M C" or "Smith John C"
+                    second = tokens[1].rstrip(".")
+                    if len(second) == 1:
+                        # All post-surname tokens are initials; use the first one
+                        initial = second.lower()
+                    else:
+                        # Second token is a full first name, last token is middle initial
+                        initial = second[0].lower()
+                        first   = _ascii_lower(second)
             else:
-                # Full name without comma: treat last token as first name
+                # "Surname Firstname" – last token is a full first name
                 initial = last_tok[0].lower()
                 first   = _ascii_lower(last_tok)
                 surname = _ascii_lower(tokens[0])
         else:
             surname = raw_lower
-            initial = first = ""
+            initial = ""
 
     return {"surname": surname, "first": first, "initial": initial, "raw_lower": raw_lower}
 
@@ -280,6 +325,115 @@ def confidence_label(score: float) -> str:
     return "Moderate"
 
 
+async def ai_analyze_matches(
+    aclient: anthropic.AsyncAnthropic,
+    entries: list[dict],
+) -> list[dict]:
+    """
+    Call Claude Opus 4.6 to detect anomalies in the live match listing.
+
+    Detects two problem types that the rule-based model can miss:
+
+      DUPLICATE       – two listings that are the SAME real match with
+                        different player name formats (e.g. "Rai A / Walkin B"
+                        vs "Rai, Ajeet/Walkin, Brandon").
+
+      PLAYER_CONFLICT – the same player appears in TWO DIFFERENT matches
+                        simultaneously (physically impossible; one entry has
+                        wrong data, e.g. "Nepliy, E vs Lee, G" and
+                        "Nepliy, Elina vs Talaba, Gabriela").
+
+    Returns a list of issue dicts (match_indices are 0-based):
+      {
+        "type":          "DUPLICATE" | "PLAYER_CONFLICT",
+        "match_indices": [i, j],      # 0-based indices into entries
+        "explanation":   str,
+        "confidence":    "high" | "medium" | "low",
+      }
+    """
+    if len(entries) < 2:
+        return []
+
+    numbered = "\n".join(
+        f"[{i + 1}] Home: {e['home']}  |  Away: {e['away']}"
+        for i, e in enumerate(entries)
+    )
+
+    prompt = f"""You are an expert analyst checking live tennis match listings on a sports betting \
+site for data errors.
+
+Below are ALL currently live tennis matches (1-indexed):
+
+{numbered}
+
+Identify TWO types of problems:
+
+TYPE 1 – DUPLICATE
+Two listings that represent the SAME real-world match but use different player name formats.
+Common format differences you will see:
+  • "Rai A / Walkin B"        ←→  "Rai, Ajeet/Walkin, Brandon"
+  • "Imamura M / Tajima N"    ←→  "Imamura, M/Tajima, N"
+  • "Nepliy, E"               ←→  "Nepliy, Elina"
+  • "Ibragimova, A"           ←→  "Ibragimova, Alevtina"
+  • "Bandecchi, S"            ←→  "Bandecchi, Susan"
+Flag these as DUPLICATE pairs.
+
+TYPE 2 – PLAYER_CONFLICT
+The SAME player appears in TWO DIFFERENT matches at the same time (physically impossible).
+Example: if both "Nepliy, E vs Lee, G" AND "Nepliy, Elina vs Talaba, Gabriela" are live,
+Nepliy cannot be in both — one match has the wrong opponent listed.
+Flag these as PLAYER_CONFLICT pairs.
+
+Respond ONLY with valid JSON – no markdown fences, no text outside the JSON:
+{{
+  "issues": [
+    {{
+      "type": "DUPLICATE",
+      "match_indices": [1, 3],
+      "explanation": "Match 1 and Match 3 are the same match: home sides Rai A/Walkin B = Rai Ajeet/Walkin Brandon; away sides Imamura M/Tajima N confirmed identical.",
+      "confidence": "high"
+    }},
+    {{
+      "type": "PLAYER_CONFLICT",
+      "match_indices": [2, 5],
+      "explanation": "Nepliy appears in Match 2 (vs Lee G) and Match 5 (vs Talaba Gabriela). A player cannot compete in two simultaneous matches.",
+      "confidence": "medium"
+    }}
+  ]
+}}
+
+If no issues are found return: {{"issues": []}}
+Only flag issues you are at least moderately confident about."""
+
+    try:
+        response = await aclient.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        text = next((b.text for b in response.content if b.type == "text"), "")
+
+        start = text.find("{")
+        end   = text.rfind("}") + 1
+        if start == -1 or end <= start:
+            print(f"[AI] No JSON found in response: {text[:300]}")
+            return []
+
+        data   = json.loads(text[start:end])
+        issues = data.get("issues", [])
+
+        # Convert 1-based match_indices from the prompt to 0-based
+        for issue in issues:
+            issue["match_indices"] = [idx - 1 for idx in issue.get("match_indices", [])]
+
+        return issues
+
+    except Exception as exc:
+        print(f"[AI] Analysis error: {exc}")
+        return []
+
+
 # ── Dafabet scraping ───────────────────────────────────────────────
 
 _MATCH_RE = re.compile(r"/en/live/\d+-.+-vs-.+")
@@ -405,9 +559,10 @@ async def send_telegram(text: str) -> None:
         print(f"[Telegram] error: {exc}")
 
 
-async def heartbeat_loop(started_at: datetime) -> None:
+async def heartbeat_loop(started_at: datetime, current_matches: list[dict]) -> None:
     """
     Send a Telegram 'still alive' message every HEARTBEAT_INTERVAL seconds.
+    Includes the current live match list so you can confirm what is being watched.
     Runs as a background asyncio task alongside the main polling loop.
     """
     await asyncio.sleep(HEARTBEAT_INTERVAL)   # first beat after one full interval
@@ -416,15 +571,23 @@ async def heartbeat_loop(started_at: datetime) -> None:
         hours, rem  = divmod(uptime_secs, 3600)
         minutes     = rem // 60
         now_str     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        if current_matches:
+            match_lines = "\n".join(
+                f"  {i + 1}. {e['home']} vs {e['away']}"
+                for i, e in enumerate(current_matches)
+            )
+            match_section = f"\n\n🎾 <b>Live matches ({len(current_matches)}):</b>\n{match_lines}"
+        else:
+            match_section = "\n\n🎾 No live matches right now."
+
         msg = (
             f"💓 <b>Monitor heartbeat</b>\n"
-            f"Still alive and watching tennis duplicates.\n\n"
-            f"Uptime: <b>{hours}h {minutes}m</b>\n"
-            f"Time:   {now_str}\n"
-            f"Polling every {CHECK_INTERVAL}s · "
-            f"Heartbeat every {HEARTBEAT_INTERVAL // 60}min"
+            f"Uptime: <b>{hours}h {minutes}m</b>  |  {now_str}"
+            f"{match_section}"
         )
-        print(f"[heartbeat] Sending alive message (uptime {hours}h {minutes}m)")
+        print(f"[heartbeat] Sending alive message (uptime {hours}h {minutes}m), "
+              f"{len(current_matches)} live match(es)")
         await send_telegram(msg)
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
@@ -434,6 +597,29 @@ async def heartbeat_loop(started_at: datetime) -> None:
 async def main() -> None:
     started_at    = datetime.now(timezone.utc)
     alerted_pairs: set[frozenset] = set()
+
+    # ── Anthropic client for AI analysis ──────────────────────────────
+    aclient: anthropic.AsyncAnthropic | None = None
+    if AI_ANALYSIS:
+        if ANTHROPIC_API_KEY:
+            aclient = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+            print("[*] AI analysis enabled (Claude Haiku 4.5).")
+        else:
+            print("[!] AI_ANALYSIS=true but ANTHROPIC_API_KEY not set – AI disabled.")
+
+    # ── Send startup ping BEFORE browser loads ────────────────────────
+    # This confirms the script is alive even before the first scrape.
+    ai_status = "Haiku 4.5 ✓" if aclient else "rule-based only"
+    await send_telegram(
+        f"🟢 <b>Tennis duplicate monitor starting…</b>\n"
+        f"AI analysis: <b>{ai_status}</b>\n"
+        f"Polling every {CHECK_INTERVAL}s · "
+        f"Heartbeat every {HEARTBEAT_INTERVAL // 60}min\n"
+        f"Started at: {started_at.strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+
+    # Shared list updated each scrape cycle; read by heartbeat_loop
+    current_matches: list[dict] = []
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -457,21 +643,17 @@ async def main() -> None:
         print(f"[*] Heartbeat every {HEARTBEAT_INTERVAL // 60} min")
         print(f"[*] URL: {TENNIS_URL}\n")
 
-        # ── Startup Telegram notification ─────────────────────────────
-        await send_telegram(
-            f"🟢 <b>Tennis duplicate monitor started</b>\n"
-            f"Polling every {CHECK_INTERVAL}s · "
-            f"Heartbeat every {HEARTBEAT_INTERVAL // 60}min\n"
-            f"Started at: {started_at.strftime('%Y-%m-%d %H:%M UTC')}"
-        )
-
         # ── Launch heartbeat as a background task ─────────────────────
-        heartbeat_task = asyncio.create_task(heartbeat_loop(started_at))
+        heartbeat_task = asyncio.create_task(heartbeat_loop(started_at, current_matches))
 
         try:
             while True:
                 entries = await extract_matches(page, TENNIS_URL)
                 current_urls = {e["url"] for e in entries}
+
+                # Keep heartbeat_loop up to date with latest match list
+                current_matches.clear()
+                current_matches.extend(entries)
 
                 # ── Expire pairs where a match is no longer live ─────────
                 expired = {pk for pk in alerted_pairs if not pk.issubset(current_urls)}
@@ -518,6 +700,63 @@ async def main() -> None:
                             alerted_pairs.add(s["pair_key"])
                     else:
                         print("    No duplicates detected in this cycle.")
+
+                    # ── AI analysis (Claude Opus 4.6) ─────────────────────────
+                    if aclient:
+                        print("\n[AI] Running Claude Opus 4.6 analysis…")
+                        ai_issues = await ai_analyze_matches(aclient, entries)
+
+                        new_ai = []
+                        for issue in ai_issues:
+                            idxs = issue.get("match_indices", [])
+                            if len(idxs) < 2:
+                                continue
+                            i, j = idxs[0], idxs[1]
+                            if i >= len(entries) or j >= len(entries) or i < 0 or j < 0:
+                                continue
+                            pair_key = frozenset([entries[i]["url"], entries[j]["url"]])
+                            if pair_key not in alerted_pairs:
+                                issue["pair_key"]  = pair_key
+                                issue["match_a"]   = entries[i]
+                                issue["match_b"]   = entries[j]
+                                new_ai.append(issue)
+
+                        if new_ai:
+                            print(f"[AI] {len(new_ai)} new issue(s) detected!")
+                            for issue in new_ai:
+                                a    = issue["match_a"]
+                                b    = issue["match_b"]
+                                kind = issue["type"]
+                                conf = issue["confidence"].capitalize()
+                                expl = issue["explanation"]
+
+                                print(
+                                    f"  [{kind} – {conf}]\n"
+                                    f"    A: {a['home']} vs {a['away']}\n"
+                                    f"    B: {b['home']} vs {b['away']}\n"
+                                    f"    {expl}"
+                                )
+
+                                if kind == "DUPLICATE":
+                                    emoji      = "🎾"
+                                    type_label = "Possible duplicate tennis match! (AI)"
+                                else:
+                                    emoji      = "⚠️"
+                                    type_label = "Player conflict detected! (AI)"
+
+                                msg = (
+                                    f"{emoji} <b>{type_label}</b>\n"
+                                    f"Confidence: <b>{conf}</b>\n\n"
+                                    f"<b>Match A:</b>  {a['home']}  vs  {a['away']}\n"
+                                    f"<b>Match B:</b>  {b['home']}  vs  {b['away']}\n\n"
+                                    f"<b>AI analysis:</b> {expl}\n\n"
+                                    f"<a href='{a['url']}'>Open Match A</a>\n"
+                                    f"<a href='{b['url']}'>Open Match B</a>"
+                                )
+                                await send_telegram(msg)
+                                alerted_pairs.add(issue["pair_key"])
+                        else:
+                            print("[AI] No new issues detected.")
 
                 print(f"\n--- sleeping {CHECK_INTERVAL}s ---\n")
                 await asyncio.sleep(CHECK_INTERVAL)
