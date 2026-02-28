@@ -90,6 +90,12 @@ ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 # Enable AI analysis using Claude Haiku 4.5 (requires ANTHROPIC_API_KEY)
 AI_ANALYSIS: bool = os.getenv("AI_ANALYSIS", "true").lower() in ("1", "true", "yes")
 
+# Max candidate pairs to AI-classify per cycle (cost / rate-limit control)
+MAX_AI_PAIRS: int = int(os.getenv("MAX_AI_PAIRS", "15"))
+
+# Min pairwise player similarity (0–1) for a pair to qualify for AI classification
+AI_PAIR_MIN_SIM: float = float(os.getenv("AI_PAIR_MIN_SIM", "0.50"))
+
 # Tennis live page URL
 TENNIS_URL: str = "https://sports.dafabet.com/en/live/sport/239-TENN"
 
@@ -325,28 +331,186 @@ def confidence_label(score: float) -> str:
     return "Moderate"
 
 
+def compute_pair_checks(a: dict, b: dict) -> dict:
+    """
+    Compute the pre-check values that the pairwise AI classifier relies on.
+
+    Returns:
+      same_tournament  – bool | None (None = unknown, skip that rule)
+      gender_match     – bool | None (None = cannot infer from names)
+      event_type_match – bool  (singles vs doubles, detected via "/" in name)
+      same_player_exact – bool (at least one normalised name-key appears in both)
+      overlap_possible – bool  (always True for live entries; both are live right now)
+      anomaly_flags    – list[dict]  (non-person entities, size mismatches, etc.)
+    """
+    # ── same_tournament ────────────────────────────────────────────
+    sec_a = _ascii_lower(a.get("section", ""))
+    sec_b = _ascii_lower(b.get("section", ""))
+    same_tournament: bool | None = (sec_a == sec_b) if (sec_a and sec_b) else None
+
+    # ── gender_match ───────────────────────────────────────────────
+    # Cannot reliably infer gender from Dafabet name strings alone.
+    gender_match: bool | None = None
+
+    # ── event_type_match ───────────────────────────────────────────
+    def _is_doubles(name: str) -> bool:
+        return "/" in name
+
+    a_doubles = _is_doubles(a["home"]) or _is_doubles(a["away"])
+    b_doubles = _is_doubles(b["home"]) or _is_doubles(b["away"])
+    event_type_match: bool = a_doubles == b_doubles
+
+    # ── same_player_exact ──────────────────────────────────────────
+    def _name_key(raw: str) -> str:
+        p = parse_player(raw)
+        if p["first"]:    return f"{p['surname']}_{p['first']}"
+        if p["initial"]:  return f"{p['surname']}_{p['initial']}"
+        return p["surname"]
+
+    def _all_keys(entry: dict) -> set[str]:
+        keys: set[str] = set()
+        for side in (entry["home"], entry["away"]):
+            for player in split_doubles(side):
+                keys.add(_name_key(player))
+        return keys
+
+    keys_a = _all_keys(a)
+    keys_b = _all_keys(b)
+    same_player_exact: bool = bool(keys_a & keys_b)
+
+    # ── overlap_possible ───────────────────────────────────────────
+    # All scraped entries are currently live at the same time.
+    overlap_possible: bool = True
+
+    # ── anomaly_flags ──────────────────────────────────────────────
+    CLUB_MARKERS = ("sv ", "fc ", "sc ", "ac ", "bk ", "sk ", "nk ", "rk ",
+                    " fc", " sc", " ac")
+    anomaly_flags: list[dict] = []
+    for entry, label in ((a, "A"), (b, "B")):
+        for side, pos in ((entry["home"], "home"), (entry["away"], "away")):
+            lo = _ascii_lower(side)
+            if any(lo.startswith(m.strip()) or m in f" {lo}" for m in CLUB_MARKERS):
+                anomaly_flags.append({
+                    "type":     "non_person_entity_in_player_slot",
+                    "severity": "high",
+                    "evidence": f"Match {label} {pos}: {side!r} looks like a club/team",
+                })
+
+    return {
+        "same_tournament":   same_tournament,
+        "gender_match":      gender_match,
+        "event_type_match":  event_type_match,
+        "same_player_exact": same_player_exact,
+        "overlap_possible":  overlap_possible,
+        "anomaly_flags":     anomaly_flags,
+    }
+
+
+def _build_classifier_prompt(a: dict, b: dict, checks: dict) -> str:
+    """Fill the pairwise classifier prompt template with computed values."""
+
+    def _nullable(v: bool | None) -> str:
+        if v is None:
+            return "null"
+        return str(v).lower()
+
+    checks_block = (
+        "{\n"
+        f'  "same_tournament":   {_nullable(checks["same_tournament"])},\n'
+        f'  "gender_match":      {_nullable(checks["gender_match"])},\n'
+        f'  "event_type_match":  {_nullable(checks["event_type_match"])},\n'
+        f'  "same_player_exact": {_nullable(checks["same_player_exact"])},\n'
+        f'  "overlap_possible":  {_nullable(checks["overlap_possible"])}\n'
+        "}"
+    )
+    anomaly_block = json.dumps(checks["anomaly_flags"], indent=2) if checks["anomaly_flags"] else "[]"
+    sec_a = a.get("section") or "unknown"
+    sec_b = b.get("section") or "unknown"
+    match_a_str = f"Home: {a['home']}  |  Away: {a['away']}  [section: {sec_a}]"
+    match_b_str = f"Home: {b['home']}  |  Away: {b['away']}  [section: {sec_b}]"
+
+    return (
+        "You are a tennis match integrity classifier for a monitoring bot.\n"
+        "You MUST follow the hard rules below. Do NOT infer beyond them.\n\n"
+        "HARD RULES (never break):\n"
+        "1) Different tournaments/events => NEVER conflict.\n"
+        "2) Different gender (Men vs Women) => NEVER conflict.\n"
+        "3) Singles vs doubles => NEVER conflict.\n"
+        "4) Surname-only match is NOT the same person.\n"
+        "5) Club/team strings are not players — flag as ANOMALY, not conflict.\n"
+        "6) conflict verdict requires BOTH same_player_exact=true AND overlap_possible=true.\n"
+        "7) If a check value is null (unknown), skip that rule; proceed to next check.\n"
+        "8) Name-format differences only (e.g. 'Gaston, Hugo' vs 'Gaston Hugo') do NOT prove conflict.\n\n"
+        "DECISION PROCESS:\n"
+        "- If same_tournament=false            => verdict=no_conflict\n"
+        "- Else if gender_match=false          => verdict=no_conflict\n"
+        "- Else if event_type_match=false      => verdict=no_conflict\n"
+        "- Else if same_player_exact=false     => verdict=no_conflict\n"
+        "- Else if overlap_possible=false      => verdict=no_conflict\n"
+        "- Else                                => verdict=conflict\n"
+        "- If anomaly_flags non-empty AND verdict would be no_conflict => verdict=anomaly_only\n\n"
+        "OUTPUT — JSON only, no markdown:\n"
+        '{"verdict":"no_conflict"|"conflict"|"anomaly_only",'
+        '"confidence":"low"|"medium"|"high",'
+        '"reasons":["..."],'
+        '"anomalies":[{"type":"...","severity":"low|medium|high","evidence":"..."}],'
+        '"actions":["..."]}\n\n'
+        "NOW CLASSIFY THIS CASE:\n\n"
+        f"MATCH_A: {match_a_str}\n"
+        f"MATCH_B: {match_b_str}\n\n"
+        "CHECKS (computed by code — do not override):\n"
+        f"{checks_block}\n\n"
+        f"ANOMALY_FLAGS: {anomaly_block}\n\n"
+        "REMINDERS:\n"
+        "- Do NOT claim conflict unless same_player_exact=true AND overlap_possible=true.\n"
+        "- Surname match alone is NOT same_player_exact.\n"
+        "- Club/team names are not players; report as anomaly."
+    )
+
+
+async def _ai_classify_pair(
+    aclient: anthropic.AsyncAnthropic,
+    entry_a: dict,
+    entry_b: dict,
+) -> dict | None:
+    """
+    Run the structured pairwise classifier on two match entries.
+    Returns the parsed verdict dict or None on error.
+    """
+    checks = compute_pair_checks(entry_a, entry_b)
+    prompt = _build_classifier_prompt(entry_a, entry_b, checks)
+    try:
+        response = await aclient.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = next((b.text for b in response.content if b.type == "text"), "")
+        start = text.find("{")
+        end   = text.rfind("}") + 1
+        if start == -1 or end <= start:
+            print(f"[AI] No JSON in classifier response: {text[:200]}")
+            return None
+        return json.loads(text[start:end])
+    except Exception as exc:
+        print(f"[AI] Classifier error: {exc}")
+        return None
+
+
 async def ai_analyze_matches(
     aclient: anthropic.AsyncAnthropic,
     entries: list[dict],
 ) -> list[dict]:
     """
-    Call Claude Opus 4.6 to detect anomalies in the live match listing.
+    Run the structured pairwise classifier on candidate match pairs.
 
-    Detects two problem types that the rule-based model can miss:
-
-      DUPLICATE       – two listings that are the SAME real match with
-                        different player name formats (e.g. "Rai A / Walkin B"
-                        vs "Rai, Ajeet/Walkin, Brandon").
-
-      PLAYER_CONFLICT – the same player appears in TWO DIFFERENT matches
-                        simultaneously (physically impossible; one entry has
-                        wrong data, e.g. "Nepliy, E vs Lee, G" and
-                        "Nepliy, Elina vs Talaba, Gabriela").
+    Candidate pairs are those where any player-to-player similarity is
+    >= AI_PAIR_MIN_SIM.  Results are capped at MAX_AI_PAIRS per cycle.
 
     Returns a list of issue dicts (match_indices are 0-based):
       {
-        "type":          "DUPLICATE" | "PLAYER_CONFLICT",
-        "match_indices": [i, j],      # 0-based indices into entries
+        "type":          "DUPLICATE" | "PLAYER_CONFLICT" | "ANOMALY",
+        "match_indices": [i, j],
         "explanation":   str,
         "confidence":    "high" | "medium" | "low",
       }
@@ -354,84 +518,62 @@ async def ai_analyze_matches(
     if len(entries) < 2:
         return []
 
-    numbered = "\n".join(
-        f"[{i + 1}] Home: {e['home']}  |  Away: {e['away']}"
-        for i, e in enumerate(entries)
-    )
+    # ── Build & rank candidate pairs ──────────────────────────────
+    candidates: list[tuple[int, int, float]] = []
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            a, b = entries[i], entries[j]
+            max_sim = max(
+                player_similarity(p1, p2)
+                for p1 in (a["home"], a["away"])
+                for p2 in (b["home"], b["away"])
+            )
+            if max_sim >= AI_PAIR_MIN_SIM:
+                candidates.append((i, j, max_sim))
 
-    prompt = f"""You are an expert analyst checking live tennis match listings on a sports betting \
-site for data errors.
+    candidates.sort(key=lambda x: -x[2])
+    candidates = candidates[:MAX_AI_PAIRS]
 
-Below are ALL currently live tennis matches (1-indexed):
-
-{numbered}
-
-Identify TWO types of problems:
-
-TYPE 1 – DUPLICATE
-Two listings that represent the SAME real-world match but use different player name formats.
-Common format differences you will see:
-  • "Rai A / Walkin B"        ←→  "Rai, Ajeet/Walkin, Brandon"
-  • "Imamura M / Tajima N"    ←→  "Imamura, M/Tajima, N"
-  • "Nepliy, E"               ←→  "Nepliy, Elina"
-  • "Ibragimova, A"           ←→  "Ibragimova, Alevtina"
-  • "Bandecchi, S"            ←→  "Bandecchi, Susan"
-Flag these as DUPLICATE pairs.
-
-TYPE 2 – PLAYER_CONFLICT
-The SAME player appears in TWO DIFFERENT matches at the same time (physically impossible).
-Example: if both "Nepliy, E vs Lee, G" AND "Nepliy, Elina vs Talaba, Gabriela" are live,
-Nepliy cannot be in both — one match has the wrong opponent listed.
-Flag these as PLAYER_CONFLICT pairs.
-
-Respond ONLY with valid JSON – no markdown fences, no text outside the JSON:
-{{
-  "issues": [
-    {{
-      "type": "DUPLICATE",
-      "match_indices": [1, 3],
-      "explanation": "Match 1 and Match 3 are the same match: home sides Rai A/Walkin B = Rai Ajeet/Walkin Brandon; away sides Imamura M/Tajima N confirmed identical.",
-      "confidence": "high"
-    }},
-    {{
-      "type": "PLAYER_CONFLICT",
-      "match_indices": [2, 5],
-      "explanation": "Nepliy appears in Match 2 (vs Lee G) and Match 5 (vs Talaba Gabriela). A player cannot compete in two simultaneous matches.",
-      "confidence": "medium"
-    }}
-  ]
-}}
-
-If no issues are found return: {{"issues": []}}
-Only flag issues you are at least moderately confident about."""
-
-    try:
-        response = await aclient.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        text = next((b.text for b in response.content if b.type == "text"), "")
-
-        start = text.find("{")
-        end   = text.rfind("}") + 1
-        if start == -1 or end <= start:
-            print(f"[AI] No JSON found in response: {text[:300]}")
-            return []
-
-        data   = json.loads(text[start:end])
-        issues = data.get("issues", [])
-
-        # Convert 1-based match_indices from the prompt to 0-based
-        for issue in issues:
-            issue["match_indices"] = [idx - 1 for idx in issue.get("match_indices", [])]
-
-        return issues
-
-    except Exception as exc:
-        print(f"[AI] Analysis error: {exc}")
+    if not candidates:
         return []
+
+    print(f"[AI] Classifying {len(candidates)} candidate pair(s) with pairwise classifier…")
+
+    issues: list[dict] = []
+    for i, j, pre_sim in candidates:
+        a, b = entries[i], entries[j]
+        result = await _ai_classify_pair(aclient, a, b)
+        if result is None:
+            continue
+
+        verdict   = result.get("verdict", "no_conflict")
+        conf      = result.get("confidence", "medium")
+        reasons   = result.get("reasons", [])
+        anomalies = result.get("anomalies", [])
+
+        if verdict == "conflict":
+            # Distinguish DUPLICATE (all players match, high rule-based score)
+            # from PLAYER_CONFLICT (partial overlap, lower rule-based score).
+            rb_score, _ = match_similarity(a, b)
+            kind = "DUPLICATE" if rb_score >= SIMILARITY_THRESHOLD * 0.7 else "PLAYER_CONFLICT"
+            issues.append({
+                "type":          kind,
+                "match_indices": [i, j],
+                "explanation":   " | ".join(reasons) if reasons else f"AI conflict (pre-sim {pre_sim:.2f})",
+                "confidence":    conf,
+            })
+
+        elif verdict == "anomaly_only":
+            high = [an for an in anomalies if an.get("severity") == "high"]
+            if high:
+                issues.append({
+                    "type":          "ANOMALY",
+                    "match_indices": [i, j],
+                    "explanation":   " | ".join(an["evidence"] for an in high),
+                    "confidence":    conf,
+                })
+
+    return issues
 
 
 # ── Dafabet scraping ───────────────────────────────────────────────
@@ -507,6 +649,24 @@ async def extract_matches(page: Page, url: str) -> list[dict]:
                 if (seen.has(href)) continue;
                 seen.add(href);
 
+                // Find section/tournament name (best-effort, graceful on miss)
+                let section = "";
+                let secEl = link.parentElement;
+                for (let sd = 0; sd < 20 && secEl; sd++) {
+                    const sc = secEl.getAttribute('class') || '';
+                    if (sc.includes('bg-th-card-container') && secEl.hasAttribute('data-state')) {
+                        for (const ch of secEl.children) {
+                            const t = ch.innerText ? ch.innerText.trim().split(String.fromCharCode(10))[0] : '';
+                            if (t.length > 2 && t.length < 120 && !t.includes(' vs ') && !t.includes('/')) {
+                                section = t;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                    secEl = secEl.parentElement;
+                }
+
                 // Walk up from the link to find the card container
                 let container = link.parentElement;
                 let found = false;
@@ -517,9 +677,10 @@ async def extract_matches(page: Page, url: str) -> list[dict]:
                     });
                     if (nameDivs.length >= 2) {
                         results.push({
-                            url:  href,
-                            home: nameDivs[0].innerText.trim(),
-                            away: nameDivs[1].innerText.trim(),
+                            url:     href,
+                            home:    nameDivs[0].innerText.trim(),
+                            away:    nameDivs[1].innerText.trim(),
+                            section: section,
                         });
                         found = true;
                         break;
@@ -534,7 +695,7 @@ async def extract_matches(page: Page, url: str) -> list[dict]:
                         const numEnd = slug.indexOf('-');
                         const homePart = slug.slice(numEnd + 1, vsIdx).replace(/-/g, ' ');
                         const awayPart = slug.slice(vsIdx + 4).replace(/-/g, ' ');
-                        results.push({ url: href, home: homePart, away: awayPart });
+                        results.push({ url: href, home: homePart, away: awayPart, section: section });
                     }
                 }
             }
@@ -603,7 +764,7 @@ async def main() -> None:
     if AI_ANALYSIS:
         if ANTHROPIC_API_KEY:
             aclient = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-            print("[*] AI analysis enabled (Claude Haiku 4.5).")
+            print("[*] AI pairwise classifier enabled (Claude Haiku 4.5).")
         else:
             print("[!] AI_ANALYSIS=true but ANTHROPIC_API_KEY not set – AI disabled.")
 
@@ -703,7 +864,7 @@ async def main() -> None:
 
                     # ── AI analysis (Claude Opus 4.6) ─────────────────────────
                     if aclient:
-                        print("\n[AI] Running Claude Opus 4.6 analysis…")
+                        print("\n[AI] Running pairwise classifier (Claude Haiku 4.5)…")
                         ai_issues = await ai_analyze_matches(aclient, entries)
 
                         new_ai = []
@@ -740,9 +901,12 @@ async def main() -> None:
                                 if kind == "DUPLICATE":
                                     emoji      = "🎾"
                                     type_label = "Possible duplicate tennis match! (AI)"
-                                else:
+                                elif kind == "PLAYER_CONFLICT":
                                     emoji      = "⚠️"
                                     type_label = "Player conflict detected! (AI)"
+                                else:  # ANOMALY
+                                    emoji      = "🔍"
+                                    type_label = "Listing anomaly detected! (AI)"
 
                                 msg = (
                                     f"{emoji} <b>{type_label}</b>\n"
