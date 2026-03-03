@@ -25,7 +25,7 @@ when the similarity score exceeds SIMILARITY_THRESHOLD.
 
 Quick-start
 -----------
-1. cp .env.example .env   # fill in credentials (Telegram + Anthropic)
+1. cp .env.example .env   # fill in credentials
 2. pip install -r requirements.txt
 3. playwright install chromium
 4. python monitor.py
@@ -33,7 +33,6 @@ Quick-start
 Required .env keys:
   TELEGRAM_BOT_TOKEN   – Telegram bot token
   TELEGRAM_CHAT_ID     – Telegram chat/group ID
-  ANTHROPIC_API_KEY    – Anthropic API key (enables Claude Opus 4.6 analysis)
 
 Optional .env keys:
   CHECK_INTERVAL       – seconds between polls (default: 60)
@@ -41,7 +40,10 @@ Optional .env keys:
   SIMILARITY_THRESHOLD – rule-based duplicate threshold (default: 0.75)
   MIN_SIDE_SCORE       – rule-based per-side floor (default: 0.60)
   HEADLESS             – run browser headless (default: true)
-  AI_ANALYSIS          – enable Claude Opus 4.6 analysis (default: true)
+  AI_ANALYSIS          – enable LLM analysis layer (default: true)
+  LLM_PROVIDER         – which LLM to use: "claude" or "deepseek" (default: claude)
+  ANTHROPIC_API_KEY    – required when LLM_PROVIDER=claude  (Claude Haiku 4.5)
+  DEEPSEEK_API_KEY     – required when LLM_PROVIDER=deepseek (DeepSeek R1)
 """
 
 import asyncio
@@ -85,11 +87,17 @@ MIN_SIDE_SCORE: float       = float(os.getenv("MIN_SIDE_SCORE", "0.60"))
 # MUST be True on a headless VPS (no display); False for local debugging.
 HEADLESS: bool = os.getenv("HEADLESS", "true").lower() in ("1", "true", "yes")
 
-# Anthropic API key for AI-powered analysis (optional – falls back to rule-based only)
+# Enable AI analysis layer (default: true)
+AI_ANALYSIS: bool = os.getenv("AI_ANALYSIS", "true").lower() in ("1", "true", "yes")
+
+# Which LLM provider to use: "claude" or "deepseek"
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "claude").lower()
+
+# Anthropic API key – required when LLM_PROVIDER=claude
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 
-# Enable AI analysis using Claude Haiku 4.5 (requires ANTHROPIC_API_KEY)
-AI_ANALYSIS: bool = os.getenv("AI_ANALYSIS", "true").lower() in ("1", "true", "yes")
+# DeepSeek API key – required when LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
 
 # Tennis live page URL
 TENNIS_URL: str = "https://sports.dafabet.com/en/live/sport/239-TENN"
@@ -353,39 +361,20 @@ def save_alerted_pairs(pairs: set[frozenset]) -> None:
         print(f"[warn] Could not save alerted pairs: {exc}")
 
 
-async def ai_analyze_matches(
-    aclient: anthropic.AsyncAnthropic,
-    entries: list[dict],
-) -> list[dict]:
-    """
-    Send the full list of live match entries to Claude in a single batch call.
-
-    Detects two issue types:
-      DUPLICATE       – same real match listed twice with different name formats
-      PLAYER_CONFLICT – same player appearing in two different live matches simultaneously
-
-    Returns a list of issue dicts (match_indices are 0-based):
-      {
-        "type":          "DUPLICATE" | "PLAYER_CONFLICT",
-        "match_indices": [i, j],
-        "explanation":   str,
-        "confidence":    "high" | "medium" | "low",
-      }
-    """
-    if len(entries) < 2:
-        return []
-
+def _build_ai_prompt(entries: list[dict]) -> str:
+    """Shared prompt for all LLM providers."""
     match_list = "\n".join(
         f"{i + 1}. Home: {e['home']} | Away: {e['away']} | Section: {e.get('section') or 'unknown'}"
         for i, e in enumerate(entries)
     )
-
-    prompt = (
+    return (
         "You are a tennis match integrity monitor for a live sports betting site.\n"
         "Below is the complete list of currently live tennis matches.\n\n"
         "Find these issues:\n"
         "1. DUPLICATE — same real match listed twice with different name formats.\n"
         "   Example: 'Butvilas, Edas' vs 'Butvilas, E' are the same person.\n"
+        "   Also flag reversed listings: 'Samrej, K vs Xiao, L' and 'Xiao Lexue vs Samrej, K'\n"
+        "   are the SAME match with sides swapped.\n"
         "2. PLAYER_CONFLICT — same real player appearing in two DIFFERENT matches simultaneously.\n\n"
         "Hard rules:\n"
         "- Different sections/tournaments → never a duplicate.\n"
@@ -400,21 +389,18 @@ async def ai_analyze_matches(
         f"LIVE MATCHES ({len(entries)} total):\n{match_list}"
     )
 
+
+def _parse_ai_response(text: str, entries: list[dict]) -> list[dict]:
+    """Extract and validate issues from raw LLM JSON response (shared by all providers)."""
+    start = text.find("{")
+    end   = text.rfind("}") + 1
+    if start == -1 or end <= start:
+        print(f"[AI] No JSON in response: {text[:200]}")
+        return []
     try:
-        response = await aclient.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = next((b.text for b in response.content if b.type == "text"), "")
-        start = text.find("{")
-        end   = text.rfind("}") + 1
-        if start == -1 or end <= start:
-            print(f"[AI] No JSON in response: {text[:200]}")
-            return []
         data = json.loads(text[start:end])
-    except Exception as exc:
-        print(f"[AI] Batch analysis error: {exc}")
+    except json.JSONDecodeError as exc:
+        print(f"[AI] JSON parse error: {exc}  raw: {text[start:start+200]}")
         return []
 
     issues: list[dict] = []
@@ -432,6 +418,72 @@ async def ai_analyze_matches(
             "confidence":    item.get("confidence", "medium"),
         })
     return issues
+
+
+async def _call_claude(aclient: anthropic.AsyncAnthropic, prompt: str) -> str:
+    """Call Claude Haiku 4.5 and return the raw text response."""
+    response = await aclient.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return next((b.text for b in response.content if b.type == "text"), "")
+
+
+async def _call_deepseek(prompt: str) -> str:
+    """Call DeepSeek R1 (deepseek-reasoner) via its OpenAI-compatible API and return the text response."""
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type":  "application/json",
+    }
+    payload = {
+        "model":      "deepseek-reasoner",
+        "messages":   [{"role": "user", "content": prompt}],
+        "max_tokens": 4096,
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            "https://api.deepseek.com/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+
+async def ai_analyze_matches(
+    entries:  list[dict],
+    provider: str,
+    aclient:  anthropic.AsyncAnthropic | None = None,
+) -> list[dict]:
+    """
+    Send live match entries to the selected LLM for anomaly detection.
+
+    Detects:
+      DUPLICATE       – same real match listed twice (incl. sides swapped / name formats)
+      PLAYER_CONFLICT – same player in two different live matches simultaneously
+
+    Returns list of issue dicts with 0-based match_indices.
+    provider: "claude" | "deepseek"
+    """
+    if len(entries) < 2:
+        return []
+
+    prompt = _build_ai_prompt(entries)
+
+    try:
+        if provider == "claude":
+            text = await _call_claude(aclient, prompt)
+        elif provider == "deepseek":
+            text = await _call_deepseek(prompt)
+        else:
+            print(f"[AI] Unknown provider: {provider!r}")
+            return []
+    except Exception as exc:
+        print(f"[AI] {provider} call error: {exc}")
+        return []
+
+    return _parse_ai_response(text, entries)
 
 
 # ── Dafabet scraping ───────────────────────────────────────────────
@@ -616,18 +668,30 @@ async def main() -> None:
     if alerted_pairs:
         print(f"[*] Loaded {len(alerted_pairs)} previously alerted pair(s) from disk.")
 
-    # ── Anthropic client for AI analysis ──────────────────────────────
-    aclient: anthropic.AsyncAnthropic | None = None
+    # ── AI provider setup ──────────────────────────────────────────────
+    aclient:     anthropic.AsyncAnthropic | None = None
+    ai_provider: str | None                      = None
+
     if AI_ANALYSIS:
-        if ANTHROPIC_API_KEY:
-            aclient = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-            print("[*] AI pairwise classifier enabled (Claude Haiku 4.5).")
+        if LLM_PROVIDER == "claude":
+            if ANTHROPIC_API_KEY:
+                aclient     = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+                ai_provider = "claude"
+                print("[*] AI analysis enabled – Claude Haiku 4.5.")
+            else:
+                print("[!] LLM_PROVIDER=claude but ANTHROPIC_API_KEY not set – AI disabled.")
+        elif LLM_PROVIDER == "deepseek":
+            if DEEPSEEK_API_KEY:
+                ai_provider = "deepseek"
+                print("[*] AI analysis enabled – DeepSeek R1.")
+            else:
+                print("[!] LLM_PROVIDER=deepseek but DEEPSEEK_API_KEY not set – AI disabled.")
         else:
-            print("[!] AI_ANALYSIS=true but ANTHROPIC_API_KEY not set – AI disabled.")
+            print(f"[!] Unknown LLM_PROVIDER={LLM_PROVIDER!r}. Use 'claude' or 'deepseek'.")
 
     # ── Send startup ping BEFORE browser loads ────────────────────────
-    # This confirms the script is alive even before the first scrape.
-    ai_status = "Haiku 4.5 ✓" if aclient else "rule-based only"
+    _provider_labels = {"claude": "Claude Haiku 4.5", "deepseek": "DeepSeek R1"}
+    ai_status = f"{_provider_labels.get(ai_provider, '')} ✓" if ai_provider else "rule-based only"
     await send_telegram(
         f"🟢 <b>Tennis duplicate monitor starting…</b>\n"
         f"AI analysis: <b>{ai_status}</b>\n"
@@ -721,10 +785,11 @@ async def main() -> None:
                     else:
                         print("    No duplicates detected in this cycle.")
 
-                    # ── AI analysis (Claude Opus 4.6) ─────────────────────────
-                    if aclient:
-                        print("\n[AI] Running batch analysis (Claude Haiku 4.5)…")
-                        ai_issues = await ai_analyze_matches(aclient, entries)
+                    # ── AI analysis ───────────────────────────────────────────
+                    if ai_provider:
+                        label = _provider_labels.get(ai_provider, ai_provider)
+                        print(f"\n[AI] Running batch analysis ({label})…")
+                        ai_issues = await ai_analyze_matches(entries, ai_provider, aclient)
 
                         new_ai = []
                         for issue in ai_issues:
@@ -757,12 +822,13 @@ async def main() -> None:
                                     f"    {expl}"
                                 )
 
+                                ai_tag = _provider_labels.get(ai_provider, ai_provider)
                                 if kind == "PLAYER_CONFLICT":
                                     emoji      = "⚠️"
-                                    type_label = "Player conflict detected! (AI)"
+                                    type_label = f"Player conflict detected! ({ai_tag})"
                                 else:  # DUPLICATE
                                     emoji      = "🎾"
-                                    type_label = "Possible duplicate tennis match! (AI)"
+                                    type_label = f"Possible duplicate tennis match! ({ai_tag})"
 
                                 msg = (
                                     f"{emoji} <b>{type_label}</b>\n"
