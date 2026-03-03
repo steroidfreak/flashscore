@@ -297,11 +297,6 @@ def match_similarity(entry_a: dict, entry_b: dict) -> tuple[float, str]:
     if min_side < MIN_SIDE_SCORE:
         score = min(score, MIN_SIDE_SCORE - 0.01)
 
-    # Secondary: URL slug comparison (format-independent, informational)
-    slug_sim = slug_similarity(entry_a["url"], entry_b["url"])
-    if slug_sim >= 0.70:
-        expl += f"\n  URL slug similarity: {slug_sim:.2f}"
-
     return score, expl
 
 
@@ -356,36 +351,6 @@ def save_alerted_pairs(pairs: set[frozenset]) -> None:
         )
     except Exception as exc:
         print(f"[warn] Could not save alerted pairs: {exc}")
-
-
-# ── URL slug helpers ───────────────────────────────────────────────
-
-def _parse_slug(url: str) -> tuple[str, str]:
-    """
-    Extract home/away name strings from a Dafabet match URL slug.
-    e.g. /en/live/12345-butvilas-e-vs-imamura-m → ('butvilas e', 'imamura m')
-    URL slugs are lowercase, hyphen-separated, and format-independent.
-    """
-    path = url.split("?")[0]
-    m = re.search(r"/en/live/\d+-(.+)-vs-(.+)$", path)
-    if not m:
-        return "", ""
-    return m.group(1).replace("-", " "), m.group(2).replace("-", " ")
-
-
-def slug_similarity(url_a: str, url_b: str) -> float:
-    """
-    Compare match URLs' slug-encoded player names as a secondary signal.
-    URL slugs are format-independent (no commas, always lowercase) so they
-    provide an independent confirmation signal alongside DOM-extracted names.
-    """
-    ha, aa = _parse_slug(url_a)
-    hb, ab = _parse_slug(url_b)
-    if not ha or not hb:
-        return 0.0
-    s_norm = (player_similarity(ha, hb) + player_similarity(aa, ab)) / 2
-    s_rev  = (player_similarity(ha, ab) + player_similarity(aa, hb)) / 2
-    return max(s_norm, s_rev)
 
 
 async def ai_analyze_matches(
@@ -470,9 +435,6 @@ async def ai_analyze_matches(
 
 
 # ── Dafabet scraping ───────────────────────────────────────────────
-
-_MATCH_RE = re.compile(r"/en/live/\d+-.+-vs-.+")
-
 
 async def expand_all_sections(page: Page) -> int:
     """
