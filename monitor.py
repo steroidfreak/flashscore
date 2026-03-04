@@ -71,7 +71,7 @@ TELEGRAM_BOT_TOKEN: str   = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID:   str   = os.environ["TELEGRAM_CHAT_ID"]
 
 # Seconds between each poll of the tennis listing page (default 1 minute)
-CHECK_INTERVAL: int       = int(os.getenv("CHECK_INTERVAL", "60"))
+CHECK_INTERVAL: int       = int(os.getenv("CHECK_INTERVAL", "120"))
 
 # Send a "still alive" heartbeat message every N seconds (default 1 hour)
 HEARTBEAT_INTERVAL: int   = int(os.getenv("HEARTBEAT_INTERVAL", "3600"))
