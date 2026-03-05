@@ -67,8 +67,18 @@ load_dotenv()
 #  CONFIG  ← sensitive values live in .env; tune the rest here
 # ══════════════════════════════════════════════════════════════════
 
-TELEGRAM_BOT_TOKEN: str   = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID:   str   = os.environ["TELEGRAM_CHAT_ID"]
+# Each entry is a (bot_token, chat_id) pair.
+# Primary: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+# Optional second: TELEGRAM_BOT_TOKEN_2 + TELEGRAM_CHAT_ID_2
+def _build_telegram_recipients() -> list[tuple[str, str]]:
+    pairs = [(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"])]
+    tok2 = os.getenv("TELEGRAM_BOT_TOKEN_2", "").strip()
+    cid2 = os.getenv("TELEGRAM_CHAT_ID_2", "").strip()
+    if tok2 and cid2:
+        pairs.append((tok2, cid2))
+    return pairs
+
+TELEGRAM_RECIPIENTS: list[tuple[str, str]] = _build_telegram_recipients()
 
 # Seconds between each poll of the tennis listing page (default 1 minute)
 CHECK_INTERVAL: int       = int(os.getenv("CHECK_INTERVAL", "120"))
@@ -616,15 +626,16 @@ async def extract_matches(page: Page, url: str) -> list[dict]:
 # ── Telegram helpers ───────────────────────────────────────────────
 
 async def send_telegram(text: str) -> None:
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(api_url, json=payload)
-            if not resp.is_success:
-                print(f"[Telegram] {resp.status_code}: {resp.text[:200]}")
-    except Exception as exc:
-        print(f"[Telegram] error: {exc}")
+    async with httpx.AsyncClient(timeout=10) as client:
+        for bot_token, chat_id in TELEGRAM_RECIPIENTS:
+            api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+            try:
+                resp = await client.post(api_url, json=payload)
+                if not resp.is_success:
+                    print(f"[Telegram] {chat_id}: {resp.status_code}: {resp.text[:200]}")
+            except Exception as exc:
+                print(f"[Telegram] {chat_id}: error: {exc}")
 
 
 async def heartbeat_loop(started_at: datetime, current_matches: list[dict]) -> None:
