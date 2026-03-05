@@ -36,7 +36,7 @@ Required .env keys:
 
 Optional .env keys:
   CHECK_INTERVAL       – seconds between polls (default: 60)
-  HEARTBEAT_INTERVAL   – seconds between heartbeat messages (default: 3600)
+  HEARTBEAT_INTERVAL   – seconds between heartbeat messages (default: 21600)
   SIMILARITY_THRESHOLD – rule-based duplicate threshold (default: 0.75)
   MIN_SIDE_SCORE       – rule-based per-side floor (default: 0.60)
   HEADLESS             – run browser headless (default: true)
@@ -84,7 +84,7 @@ TELEGRAM_RECIPIENTS: list[tuple[str, str]] = _build_telegram_recipients()
 CHECK_INTERVAL: int       = int(os.getenv("CHECK_INTERVAL", "120"))
 
 # Send a "still alive" heartbeat message every N seconds (default 1 hour)
-HEARTBEAT_INTERVAL: int   = int(os.getenv("HEARTBEAT_INTERVAL", "3600"))
+HEARTBEAT_INTERVAL: int   = int(os.getenv("HEARTBEAT_INTERVAL", "21600"))
 
 # Similarity score (0.0–1.0) above which a pair is flagged as a likely duplicate.
 # Lower = more sensitive (more alerts); higher = stricter.
