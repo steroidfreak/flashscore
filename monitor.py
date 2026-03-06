@@ -36,7 +36,7 @@ Required .env keys:
 
 Optional .env keys:
   CHECK_INTERVAL       – seconds between polls (default: 60)
-  HEARTBEAT_INTERVAL   – seconds between heartbeat messages (default: 21600)
+  HEARTBEAT_INTERVAL   – (removed) heartbeat is now sent daily at 07:00 UTC
   SIMILARITY_THRESHOLD – rule-based duplicate threshold (default: 0.75)
   MIN_SIDE_SCORE       – rule-based per-side floor (default: 0.60)
   HEADLESS             – run browser headless (default: true)
@@ -51,7 +51,7 @@ import json
 import os
 import re
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -83,8 +83,7 @@ TELEGRAM_RECIPIENTS: list[tuple[str, str]] = _build_telegram_recipients()
 # Seconds between each poll of the tennis listing page (default 1 minute)
 CHECK_INTERVAL: int       = int(os.getenv("CHECK_INTERVAL", "120"))
 
-# Send a "still alive" heartbeat message every N seconds (default 1 hour)
-HEARTBEAT_INTERVAL: int   = int(os.getenv("HEARTBEAT_INTERVAL", "21600"))
+# Heartbeat is sent daily at 07:00 UTC (no longer configurable via env)
 
 # Similarity score (0.0–1.0) above which a pair is flagged as a likely duplicate.
 # Lower = more sensitive (more alerts); higher = stricter.
@@ -114,6 +113,9 @@ TENNIS_URL: str = "https://sports.dafabet.com/en/live/sport/239-TENN"
 
 # File used to persist alerted pairs across restarts
 PAIRS_FILE: Path = Path(".alerted_pairs.json")
+
+# Directory for anomaly investigation reports
+ANOMALY_DIR: Path = Path("anomaly_reports")
 
 # ══════════════════════════════════════════════════════════════════
 
@@ -638,13 +640,29 @@ async def send_telegram(text: str) -> None:
                 print(f"[Telegram] {chat_id}: error: {exc}")
 
 
-async def heartbeat_loop(started_at: datetime, current_matches: list[dict]) -> None:
+def _seconds_until_next_7am_utc() -> float:
+    """Return seconds until the next 07:00 UTC."""
+    now = datetime.now(timezone.utc)
+    target = now.replace(hour=7, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+async def heartbeat_loop(
+    started_at:      datetime,
+    current_matches: list[dict],
+    pending_reports: list[dict],
+) -> None:
     """
-    Send a Telegram 'still alive' message every HEARTBEAT_INTERVAL seconds.
-    Includes the current live match list so you can confirm what is being watched.
+    Send a Telegram 'still alive' message every day at 07:00 UTC.
+    After the heartbeat, flush any anomaly reports accumulated since last heartbeat.
     Runs as a background asyncio task alongside the main polling loop.
     """
-    await asyncio.sleep(HEARTBEAT_INTERVAL)   # first beat after one full interval
+    wait = _seconds_until_next_7am_utc()
+    print(f"[heartbeat] Next heartbeat in {wait / 3600:.1f}h (07:00 UTC).")
+    await asyncio.sleep(wait)
+
     while True:
         uptime_secs = int((datetime.now(timezone.utc) - started_at).total_seconds())
         hours, rem  = divmod(uptime_secs, 3600)
@@ -660,22 +678,265 @@ async def heartbeat_loop(started_at: datetime, current_matches: list[dict]) -> N
         else:
             match_section = "\n\n🎾 No live matches right now."
 
+        # Count reports accumulated since last heartbeat for the summary line
+        n_reports = len(pending_reports)
+        report_summary = (
+            f"\n\n📋 <b>Anomalies since last heartbeat:</b> {n_reports}"
+            if n_reports else "\n\n📋 No anomalies since last heartbeat."
+        )
+
         msg = (
             f"💓 <b>Monitor heartbeat</b>\n"
             f"Uptime: <b>{hours}h {minutes}m</b>  |  {now_str}"
             f"{match_section}"
+            f"{report_summary}"
         )
         print(f"[heartbeat] Sending alive message (uptime {hours}h {minutes}m), "
-              f"{len(current_matches)} live match(es)")
+              f"{len(current_matches)} live match(es), {n_reports} report(s)")
         await send_telegram(msg)
-        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+        # ── Flush pending anomaly reports ──────────────────────────────
+        if pending_reports:
+            reports_to_send = pending_reports.copy()
+            pending_reports.clear()
+            for r in reports_to_send:
+                decision_emoji = "🔴" if r["decision"] == "ALERTED" else "🟡"
+                decision_label = (
+                    "ALERTED — sent to you in real-time"
+                    if r["decision"] == "ALERTED"
+                    else "SKIPPED — one match live, other not started (different dates)"
+                )
+                report_msg = (
+                    f"{decision_emoji} <b>Anomaly report [{r['type']}]</b>\n"
+                    f"Decision : <b>{decision_label}</b>\n"
+                    f"Time     : {r['timestamp']}\n\n"
+                    f"<b>Match A:</b>  {r['match_a_home']}  vs  {r['match_a_away']}\n"
+                    f"  Status: {r['status_a']}  |  Score: {r['score_a'] or '—'}  |  "
+                    f"Start: {r['start_a'] or '—'}\n\n"
+                    f"<b>Match B:</b>  {r['match_b_home']}  vs  {r['match_b_away']}\n"
+                    f"  Status: {r['status_b']}  |  Score: {r['score_b'] or '—'}  |  "
+                    f"Start: {r['start_b'] or '—'}\n\n"
+                    f"<b>Reason:</b> {r['explanation'][:300]}\n\n"
+                    f"<b>Full report:</b> <code>{r['file']}</code>"
+                )
+                await send_telegram(report_msg)
+                print(f"[heartbeat] Sent report: {r['file']}")
+
+        # Sleep until next 07:00 UTC (accounts for drift)
+        wait = _seconds_until_next_7am_utc()
+        print(f"[heartbeat] Next heartbeat in {wait / 3600:.1f}h.")
+        await asyncio.sleep(wait)
+
+
+# ── Anomaly investigation ──────────────────────────────────────────
+
+async def _extract_match_page_info(page, url: str) -> dict:
+    """
+    Open a match URL in the given page and extract key status elements.
+    Returns dict: {url, status, start_time, score, raw_texts}
+    """
+    info = {"url": url, "status": "unknown", "start_time": "", "score": "", "raw_texts": []}
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+        await page.wait_for_timeout(3_000)
+
+        raw_texts = await page.evaluate(
+            """
+            () => {
+                // Collect all meaningful short text nodes on the page
+                const results = [];
+                const walk = (el, depth) => {
+                    if (depth > 8) return;
+                    for (const child of el.children) {
+                        const tag = child.tagName;
+                        if (['SCRIPT', 'STYLE', 'NOSCRIPT'].includes(tag)) continue;
+                        const t = (child.innerText || '').trim().split('\\n')[0].trim();
+                        if (t.length > 0 && t.length < 200) results.push(t);
+                        walk(child, depth + 1);
+                    }
+                };
+                walk(document.body, 0);
+                // Deduplicate while preserving order
+                const seen = new Set();
+                return results.filter(t => { if (seen.has(t)) return false; seen.add(t); return true; });
+            }
+            """
+        )
+        info["raw_texts"] = raw_texts[:120]  # cap to avoid huge files
+
+        # Heuristic: look for status keywords in visible text
+        combined = " ".join(info["raw_texts"]).lower()
+
+        if any(k in combined for k in ("not started", "upcoming", "scheduled", "pre-match")):
+            info["status"] = "not_started"
+        elif any(k in combined for k in ("live", "in play", "in-play", "playing", "set ")):
+            info["status"] = "live"
+        elif any(k in combined for k in ("finished", "ended", "completed", "final")):
+            info["status"] = "finished"
+
+        # Try to find a start-time or score string
+        for t in raw_texts:
+            tl = t.lower()
+            if re.search(r"\d{2}:\d{2}", t) and any(w in tl for w in ("start", "begin", "scheduled", "utc", "gmt")):
+                info["start_time"] = t
+                break
+        for t in raw_texts:
+            if re.match(r"^\d+[-–]\d+$", t.strip()):
+                info["score"] = t.strip()
+                break
+
+    except Exception as exc:
+        print(f"  [warn] investigate {url}: {exc}")
+
+    return info
+
+
+def _save_anomaly_report(
+    anomaly_type:    str,
+    match_a:         dict,
+    match_b:         dict,
+    info_a:          dict,
+    info_b:          dict,
+    explanation:     str,
+    decision:        str,
+    pending_reports: list[dict],
+) -> Path:
+    """
+    Save a detailed anomaly investigation report to anomaly_reports/ and return the path.
+    Also appends a compact summary to pending_reports for the next heartbeat flush.
+    decision: "ALERTED" | "SKIPPED_DIFFERENT_STATUS"
+    """
+    ANOMALY_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+
+    # Build a short slug from the match URLs
+    def _slug(url: str) -> str:
+        part = url.rstrip("/").split("/")[-1]
+        return re.sub(r"[^a-z0-9\-]", "", part.lower())[:40]
+
+    slug = _slug(match_a["url"])
+    fname = ANOMALY_DIR / f"{timestamp}_{slug}.txt"
+
+    def _fmt_texts(texts: list[str]) -> str:
+        return "\n    ".join(texts[:40]) if texts else "(none)"
+
+    report = (
+        f"ANOMALY INVESTIGATION REPORT\n"
+        f"============================\n"
+        f"Timestamp : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+        f"Type      : {anomaly_type}\n"
+        f"Decision  : {decision}\n\n"
+        f"MATCH A\n"
+        f"-------\n"
+        f"  Home    : {match_a['home']}\n"
+        f"  Away    : {match_a['away']}\n"
+        f"  Section : {match_a.get('section', '')}\n"
+        f"  URL     : {match_a['url']}\n"
+        f"  Status  : {info_a['status']}\n"
+        f"  Score   : {info_a['score']}\n"
+        f"  Start   : {info_a['start_time']}\n"
+        f"  Page texts (first 40):\n"
+        f"    {_fmt_texts(info_a['raw_texts'])}\n\n"
+        f"MATCH B\n"
+        f"-------\n"
+        f"  Home    : {match_b['home']}\n"
+        f"  Away    : {match_b['away']}\n"
+        f"  Section : {match_b.get('section', '')}\n"
+        f"  URL     : {match_b['url']}\n"
+        f"  Status  : {info_b['status']}\n"
+        f"  Score   : {info_b['score']}\n"
+        f"  Start   : {info_b['start_time']}\n"
+        f"  Page texts (first 40):\n"
+        f"    {_fmt_texts(info_b['raw_texts'])}\n\n"
+        f"ALGORITHM EXPLANATION\n"
+        f"---------------------\n"
+        f"{explanation}\n"
+    )
+
+    fname.write_text(report, encoding="utf-8")
+    print(f"  [report] Saved anomaly report: {fname}")
+
+    # Queue a compact summary for the next heartbeat flush
+    pending_reports.append({
+        "type":         anomaly_type,
+        "decision":     decision,
+        "timestamp":    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "match_a_home": match_a["home"],
+        "match_a_away": match_a["away"],
+        "match_b_home": match_b["home"],
+        "match_b_away": match_b["away"],
+        "status_a":     info_a["status"],
+        "status_b":     info_b["status"],
+        "score_a":      info_a["score"],
+        "score_b":      info_b["score"],
+        "start_a":      info_a["start_time"],
+        "start_b":      info_b["start_time"],
+        "explanation":  explanation,
+        "file":         str(fname),
+    })
+
+    return fname
+
+
+async def investigate_and_decide(
+    browser_context: object,
+    match_a:         dict,
+    match_b:         dict,
+    anomaly_type:    str,
+    explanation:     str,
+    pending_reports: list[dict],
+) -> tuple[bool, Path | None]:
+    """
+    Open both match URLs in separate tabs, extract status elements, and decide
+    whether the flagged pair is a real anomaly or a false positive.
+
+    Returns (should_alert: bool, report_path: Path | None).
+
+    False positive rule:
+      If one match is clearly 'live' and the other is clearly 'not_started',
+      they are scheduled for different dates → skip alert.
+    """
+    print(f"  [investigate] Opening match tabs for anomaly check…")
+    page_a = await browser_context.new_page()
+    page_b = await browser_context.new_page()
+
+    try:
+        info_a, info_b = await asyncio.gather(
+            _extract_match_page_info(page_a, match_a["url"]),
+            _extract_match_page_info(page_b, match_b["url"]),
+        )
+    finally:
+        await page_a.close()
+        await page_b.close()
+
+    print(f"  [investigate] A status={info_a['status']}  B status={info_b['status']}")
+
+    statuses = {info_a["status"], info_b["status"]}
+    is_false_positive = (
+        "live" in statuses and "not_started" in statuses
+    )
+
+    decision = "SKIPPED_DIFFERENT_STATUS" if is_false_positive else "ALERTED"
+    report_path = _save_anomaly_report(
+        anomaly_type, match_a, match_b, info_a, info_b, explanation, decision, pending_reports
+    )
+
+    if is_false_positive:
+        print(
+            f"  [investigate] FALSE POSITIVE — one match live, other not started. "
+            f"Skipping alert. Report: {report_path}"
+        )
+        return False, report_path
+
+    return True, report_path
 
 
 # ── Entry point ────────────────────────────────────────────────────
 
 async def main() -> None:
-    started_at    = datetime.now(timezone.utc)
-    alerted_pairs = load_alerted_pairs()
+    started_at       = datetime.now(timezone.utc)
+    alerted_pairs    = load_alerted_pairs()
+    pending_reports: list[dict] = []   # anomaly summaries queued for next heartbeat
     if alerted_pairs:
         print(f"[*] Loaded {len(alerted_pairs)} previously alerted pair(s) from disk.")
 
@@ -706,8 +967,7 @@ async def main() -> None:
     await send_telegram(
         f"🟢 <b>Tennis duplicate monitor starting…</b>\n"
         f"AI analysis: <b>{ai_status}</b>\n"
-        f"Polling every {CHECK_INTERVAL}s · "
-        f"Heartbeat every {HEARTBEAT_INTERVAL // 60}min\n"
+        f"Polling every {CHECK_INTERVAL}s · Heartbeat daily at 07:00 UTC\n"
         f"Started at: {started_at.strftime('%Y-%m-%d %H:%M UTC')}"
     )
 
@@ -733,11 +993,13 @@ async def main() -> None:
 
         print(f"[*] Starting tennis duplicate detector. Polling every {CHECK_INTERVAL}s.")
         print(f"[*] Similarity threshold: {SIMILARITY_THRESHOLD}  |  Min per-side: {MIN_SIDE_SCORE}")
-        print(f"[*] Heartbeat every {HEARTBEAT_INTERVAL // 60} min")
+        print(f"[*] Heartbeat: daily at 07:00 UTC")
         print(f"[*] URL: {TENNIS_URL}\n")
 
         # ── Launch heartbeat as a background task ─────────────────────
-        heartbeat_task = asyncio.create_task(heartbeat_loop(started_at, current_matches))
+        heartbeat_task = asyncio.create_task(
+            heartbeat_loop(started_at, current_matches, pending_reports)
+        )
 
         try:
             while True:
@@ -780,6 +1042,15 @@ async def main() -> None:
                                 f"{s['explanation']}"
                             )
 
+                            should_alert, report_path = await investigate_and_decide(
+                                context, a, b, "DUPLICATE", s["explanation"], pending_reports
+                            )
+                            alerted_pairs.add(s["pair_key"])  # always suppress re-check
+
+                            if not should_alert:
+                                continue
+
+                            report_note = f"\n\nReport saved: {report_path}" if report_path else ""
                             msg = (
                                 f"🎾 <b>Possible duplicate tennis match!</b>\n"
                                 f"Confidence: <b>{label} ({pct}%)</b>\n\n"
@@ -789,9 +1060,9 @@ async def main() -> None:
                                 f"{s['explanation']}\n\n"
                                 f"<a href='{a['url']}'>Open Match A</a>\n"
                                 f"<a href='{b['url']}'>Open Match B</a>"
+                                f"{report_note}"
                             )
                             await send_telegram(msg)
-                            alerted_pairs.add(s["pair_key"])
                         save_alerted_pairs(alerted_pairs)
                     else:
                         print("    No duplicates detected in this cycle.")
@@ -833,6 +1104,14 @@ async def main() -> None:
                                     f"    {expl}"
                                 )
 
+                                should_alert, report_path = await investigate_and_decide(
+                                    context, a, b, kind, expl, pending_reports
+                                )
+                                alerted_pairs.add(issue["pair_key"])  # always suppress re-check
+
+                                if not should_alert:
+                                    continue
+
                                 ai_tag = _provider_labels.get(ai_provider, ai_provider)
                                 if kind == "PLAYER_CONFLICT":
                                     emoji      = "⚠️"
@@ -841,6 +1120,7 @@ async def main() -> None:
                                     emoji      = "🎾"
                                     type_label = f"Possible duplicate tennis match! ({ai_tag})"
 
+                                report_note = f"\n\nReport saved: {report_path}" if report_path else ""
                                 msg = (
                                     f"{emoji} <b>{type_label}</b>\n"
                                     f"Confidence: <b>{conf}</b>\n\n"
@@ -849,9 +1129,9 @@ async def main() -> None:
                                     f"<b>AI analysis:</b> {expl}\n\n"
                                     f"<a href='{a['url']}'>Open Match A</a>\n"
                                     f"<a href='{b['url']}'>Open Match B</a>"
+                                    f"{report_note}"
                                 )
                                 await send_telegram(msg)
-                                alerted_pairs.add(issue["pair_key"])
                             save_alerted_pairs(alerted_pairs)
                         else:
                             print("[AI] No new issues detected.")
