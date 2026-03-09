@@ -595,11 +595,15 @@ async def extract_matches(page: Page, url: str) -> list[dict]:
                         return c.includes('truncate') && c.includes('text-th-primary-text');
                     });
                     if (nameDivs.length >= 2) {
+                        // Detect "Not Started" status visible in the card on the listing page
+                        const cardText = (container.innerText || '').toLowerCase();
+                        const notStarted = cardText.includes('not started');
                         results.push({
-                            url:     href,
-                            home:    nameDivs[0].innerText.trim(),
-                            away:    nameDivs[1].innerText.trim(),
-                            section: section,
+                            url:         href,
+                            home:        nameDivs[0].innerText.trim(),
+                            away:        nameDivs[1].innerText.trim(),
+                            section:     section,
+                            not_started: notStarted,
                         });
                         found = true;
                         break;
@@ -614,7 +618,7 @@ async def extract_matches(page: Page, url: str) -> list[dict]:
                         const numEnd = slug.indexOf('-');
                         const homePart = slug.slice(numEnd + 1, vsIdx).replace(/-/g, ' ');
                         const awayPart = slug.slice(vsIdx + 4).replace(/-/g, ' ');
-                        results.push({ url: href, home: homePart, away: awayPart, section: section });
+                        results.push({ url: href, home: homePart, away: awayPart, section: section, not_started: false });
                     }
                 }
             }
@@ -1020,11 +1024,18 @@ async def main() -> None:
                 if not entries:
                     print("[!] No live tennis matches found – will retry.")
                 else:
-                    print(f"\n[*] {len(entries)} live match(es):")
-                    for e in entries:
-                        print(f"    {e['home']} vs {e['away']}")
+                    # Separate matches by status detected on the listing page
+                    live_entries       = [e for e in entries if not e.get("not_started")]
+                    not_started_entries = [e for e in entries if e.get("not_started")]
 
-                    suspects = detect_duplicates(entries)
+                    print(f"\n[*] {len(entries)} match(es) on listing page "
+                          f"({len(live_entries)} live, {len(not_started_entries)} not started):")
+                    for e in live_entries:
+                        print(f"    [LIVE]        {e['home']} vs {e['away']}")
+                    for e in not_started_entries:
+                        print(f"    [NOT STARTED] {e['home']} vs {e['away']}  ← excluded from checks")
+
+                    suspects = detect_duplicates(live_entries)
                     new_suspects = [s for s in suspects if s["pair_key"] not in alerted_pairs]
 
                     if new_suspects:
@@ -1071,7 +1082,7 @@ async def main() -> None:
                     if ai_provider:
                         label = _provider_labels.get(ai_provider, ai_provider)
                         print(f"\n[AI] Running batch analysis ({label})…")
-                        ai_issues = await ai_analyze_matches(entries, ai_provider, aclient)
+                        ai_issues = await ai_analyze_matches(live_entries, ai_provider, aclient)
 
                         new_ai = []
                         for issue in ai_issues:
@@ -1079,13 +1090,13 @@ async def main() -> None:
                             if len(idxs) < 2:
                                 continue
                             i, j = idxs[0], idxs[1]
-                            if i >= len(entries) or j >= len(entries) or i < 0 or j < 0:
+                            if i >= len(live_entries) or j >= len(live_entries) or i < 0 or j < 0:
                                 continue
-                            pair_key = frozenset([entries[i]["url"], entries[j]["url"]])
+                            pair_key = frozenset([live_entries[i]["url"], live_entries[j]["url"]])
                             if pair_key not in alerted_pairs:
                                 issue["pair_key"]  = pair_key
-                                issue["match_a"]   = entries[i]
-                                issue["match_b"]   = entries[j]
+                                issue["match_a"]   = live_entries[i]
+                                issue["match_b"]   = live_entries[j]
                                 new_ai.append(issue)
 
                         if new_ai:
