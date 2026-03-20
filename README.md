@@ -1,6 +1,6 @@
 # Dafabet Tennis Duplicate Monitor
 
-A Python + Playwright bot that watches the live tennis page on **sports.dafabet.com** every 10 seconds, detects when the same real-world match is listed twice under slightly different player name formats, and sends an instant **Telegram alert**.
+A Python + Playwright bot that watches the live tennis page on **sports.dafabet.com** every 120 seconds, detects when the same real-world match is listed twice under slightly different player name formats, and sends an instant **Telegram alert**.
 
 **Example duplicate it catches:**
 ```
@@ -15,10 +15,11 @@ Match B: Butvilas, E        vs  Imamura, M
 - Expands all collapsed league/group sections automatically
 - Handles all name formats: `"Lastname, Firstname"`, `"Lastname, F"`, `"Lastname F"`, doubles pairs (`"Player1/Player2"`)
 - Multi-strategy similarity model: exact surname + initial matching, fuzzy fallback, doubles support
-- Telegram alerts on startup, each duplicate found, and shutdown
-- Hourly **heartbeat** message confirming the monitor is still alive
+- **AI analysis layer** powered by **MiniMax-M2.7** — detects duplicates and player conflicts
+- False positive filter: opens both match pages to confirm status before alerting
+- Saves detailed anomaly reports to `anomaly_reports/`
+- Telegram alerts on startup, each duplicate found, and daily heartbeat at 07:00 UTC
 - All credentials stored in `.env` — never committed to git
-- Configurable via `.env`: poll interval, heartbeat interval, similarity threshold
 
 ---
 
@@ -30,6 +31,7 @@ flashscore/
 ├── requirements.txt  # Python dependencies
 ├── .env.example      # credential template (copy to .env and fill in)
 ├── .env              # your real secrets — git-ignored, never committed
+├── anomaly_reports/  # auto-created; detailed per-anomaly investigation reports
 └── .gitignore
 ```
 
@@ -58,15 +60,23 @@ playwright install chromium
 cp .env.example .env
 ```
 
-Open `.env` in any text editor and fill in your Telegram credentials:
+Open `.env` in any text editor and fill in your credentials:
 
 ```ini
+# Primary recipient
 TELEGRAM_BOT_TOKEN=123456:ABC-your-token-here
 TELEGRAM_CHAT_ID=987654321
+
+# Second recipient (optional — alerts go to both if set)
+TELEGRAM_BOT_TOKEN_2=789012:XYZ-second-bot-token
+TELEGRAM_CHAT_ID_2=123456789
+
+MINIMAX_API_KEY=your-minimax-api-key-here
 ```
 
-> **Get your bot token:** message [@BotFather](https://t.me/BotFather) on Telegram → `/newbot`
-> **Get your chat ID:** message [@userinfobot](https://t.me/userinfobot) on Telegram
+> **Get your Telegram bot token:** message [@BotFather](https://t.me/BotFather) on Telegram → `/newbot`
+> **Get your Telegram chat ID:** message [@userinfobot](https://t.me/userinfobot) on Telegram
+> **Get your MiniMax API key:** sign up at [platform.minimax.io](https://platform.minimax.io)
 
 ```bash
 # 5. Run
@@ -158,8 +168,15 @@ nano .env
 Minimum required content:
 
 ```ini
+# Primary recipient
 TELEGRAM_BOT_TOKEN=123456:ABC-your-token-here
 TELEGRAM_CHAT_ID=987654321
+
+# Second recipient (optional)
+TELEGRAM_BOT_TOKEN_2=789012:XYZ-second-bot-token
+TELEGRAM_CHAT_ID_2=123456789
+
+MINIMAX_API_KEY=your-minimax-api-key-here
 ```
 
 `HEADLESS` defaults to `true` on any VPS — no need to set it manually.
@@ -168,10 +185,10 @@ Optional overrides (add to `.env` if needed):
 
 ```ini
 HEADLESS=true              # always true on VPS (no display)
-CHECK_INTERVAL=10          # seconds between polls
-HEARTBEAT_INTERVAL=3600    # seconds between heartbeat messages (3600 = 1 hour)
+CHECK_INTERVAL=120         # seconds between polls (default: 120)
 SIMILARITY_THRESHOLD=0.75  # duplicate detection sensitivity (lower = more alerts)
 MIN_SIDE_SCORE=0.60        # both sides must exceed this to flag a duplicate
+AI_ANALYSIS=true           # set to false to disable MiniMax AI layer
 ```
 
 Save and exit (`Ctrl+O`, `Enter`, `Ctrl+X` in nano).
@@ -183,7 +200,7 @@ source venv/bin/activate   # if not already active
 python monitor.py
 ```
 
-You should see a Telegram message: `🟢 Tennis duplicate monitor started`. Press `Ctrl+C` to stop.
+You should see a Telegram message: `🟢 Tennis duplicate monitor starting…`. Press `Ctrl+C` to stop.
 
 ---
 
@@ -284,21 +301,26 @@ systemctl restart tennis-monitor   # apply changes
 
 ## Configuration reference
 
-All settings live in `.env`. Only `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are required.
+All settings live in `.env`. `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `MINIMAX_API_KEY` are required.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | *(required)* | Bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | *(required)* | Your numeric Telegram user/chat ID |
+| `MINIMAX_API_KEY` | *(required)* | API key from platform.minimax.io |
+| `TELEGRAM_BOT_TOKEN_2` | *(optional)* | Second bot token for a second recipient |
+| `TELEGRAM_CHAT_ID_2` | *(optional)* | Second chat ID for a second recipient |
 | `HEADLESS` | `true` | `false` shows the browser window (local dev only) |
-| `CHECK_INTERVAL` | `10` | Seconds between each poll of the tennis page |
-| `HEARTBEAT_INTERVAL` | `3600` | Seconds between "still alive" messages |
+| `CHECK_INTERVAL` | `120` | Seconds between each poll of the tennis page |
 | `SIMILARITY_THRESHOLD` | `0.75` | Score above which a pair is flagged as duplicate |
 | `MIN_SIDE_SCORE` | `0.60` | Minimum score each side (home/away) must reach |
+| `AI_ANALYSIS` | `true` | Set to `false` to disable the MiniMax AI layer |
 
 ---
 
 ## How the duplicate detection works
+
+### Rule-based layer (runs every poll)
 
 For every pair of live matches, the model scores 0.0–1.0:
 
@@ -313,29 +335,40 @@ For every pair of live matches, the model scores 0.0–1.0:
 
 A pair is flagged when the **average** of both sides ≥ `SIMILARITY_THRESHOLD` **and** neither side scores below `MIN_SIDE_SCORE`.
 
+### AI layer (MiniMax-M2.7)
+
+After the rule-based pass, the full list of live matches is sent to **MiniMax-M2.7** which independently looks for:
+- **DUPLICATE** — same match listed twice (including reversed side order and name format differences)
+- **PLAYER_CONFLICT** — same real player appearing in two different live matches simultaneously
+
+### False positive filter
+
+Before any alert is sent, the monitor opens both match pages in separate browser tabs and checks their status. If one match is `live` and the other is `not started`, the pair is treated as a false positive (different scheduled dates) and the alert is suppressed. A report is still saved to `anomaly_reports/`.
+
 ---
 
 ## Telegram alert examples
 
 **Duplicate detected:**
 ```
-🎾 Possible duplicate tennis match!
-Confidence: Very high (92%)
+🎾 Possible duplicate tennis match! (MiniMax-M2.7)
+Confidence: High
 
 Match A: Butvilas, Edas  vs  Imamura, Masamichi
 Match B: Butvilas, E     vs  Imamura, M
 
-Name comparison:
-  Home: 'Butvilas, Edas' ↔ 'Butvilas, E'  [0.92]
-  Away: 'Imamura, Masamichi' ↔ 'Imamura, M'  [0.92]
+AI analysis: Both entries refer to the same match with abbreviated vs full first names.
 ```
 
-**Hourly heartbeat:**
+**Daily heartbeat (07:00 UTC):**
 ```
 💓 Monitor heartbeat
-Still alive and watching tennis duplicates.
+Uptime: 6h 0m  |  2026-03-20 07:00 UTC
 
-Uptime: 3h 0m
-Time:   2026-02-27 12:00 UTC
-Polling every 10s · Heartbeat every 60min
+🎾 Live matches (3):
+  1. Butvilas, Edas vs Imamura, Masamichi
+  2. Shimizu Y vs Romios M C
+  3. Riera, Julia/Romero Gormaz, Leyre vs Alcala Gurri, M/Mintegi del Olmo, A
+
+📋 No anomalies since last heartbeat.
 ```

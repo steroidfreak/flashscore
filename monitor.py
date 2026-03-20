@@ -41,9 +41,7 @@ Optional .env keys:
   MIN_SIDE_SCORE       – rule-based per-side floor (default: 0.60)
   HEADLESS             – run browser headless (default: true)
   AI_ANALYSIS          – enable LLM analysis layer (default: true)
-  LLM_PROVIDER         – which LLM to use: "claude" or "deepseek" (default: claude)
-  ANTHROPIC_API_KEY    – required when LLM_PROVIDER=claude  (Claude Haiku 4.5)
-  DEEPSEEK_API_KEY     – required when LLM_PROVIDER=deepseek (DeepSeek R1)
+  MINIMAX_API_KEY      – required when AI_ANALYSIS=true (MiniMax-M2.7)
 """
 
 import asyncio
@@ -55,7 +53,6 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
-import anthropic
 import httpx
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Page
@@ -99,14 +96,8 @@ HEADLESS: bool = os.getenv("HEADLESS", "true").lower() in ("1", "true", "yes")
 # Enable AI analysis layer (default: true)
 AI_ANALYSIS: bool = os.getenv("AI_ANALYSIS", "true").lower() in ("1", "true", "yes")
 
-# Which LLM provider to use: "claude" or "deepseek"
-LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "claude").lower()
-
-# Anthropic API key – required when LLM_PROVIDER=claude
-ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-
-# DeepSeek API key – required when LLM_PROVIDER=deepseek
-DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+# MiniMax API key – required when AI_ANALYSIS=true
+MINIMAX_API_KEY: str = os.getenv("MINIMAX_API_KEY", "")
 
 # Tennis live page URL
 TENNIS_URL: str = "https://sports.dafabet.com/en/live/sport/239-TENN"
@@ -432,30 +423,20 @@ def _parse_ai_response(text: str, entries: list[dict]) -> list[dict]:
     return issues
 
 
-async def _call_claude(aclient: anthropic.AsyncAnthropic, prompt: str) -> str:
-    """Call Claude Haiku 4.5 and return the raw text response."""
-    response = await aclient.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return next((b.text for b in response.content if b.type == "text"), "")
-
-
-async def _call_deepseek(prompt: str) -> str:
-    """Call DeepSeek R1 (deepseek-reasoner) via its OpenAI-compatible API and return the text response."""
+async def _call_minimax(prompt: str) -> str:
+    """Call MiniMax-M2.7 via its OpenAI-compatible API and return the text response."""
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Authorization": f"Bearer {MINIMAX_API_KEY}",
         "Content-Type":  "application/json",
     }
     payload = {
-        "model":      "deepseek-reasoner",
+        "model":      "MiniMax-M2.7",
         "messages":   [{"role": "user", "content": prompt}],
-        "max_tokens": 4096,
+        "max_tokens": 1024,
     }
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
-            "https://api.deepseek.com/chat/completions",
+            "https://api.minimax.io/v1/chat/completions",
             headers=headers,
             json=payload,
         )
@@ -463,20 +444,15 @@ async def _call_deepseek(prompt: str) -> str:
         return resp.json()["choices"][0]["message"]["content"]
 
 
-async def ai_analyze_matches(
-    entries:  list[dict],
-    provider: str,
-    aclient:  anthropic.AsyncAnthropic | None = None,
-) -> list[dict]:
+async def ai_analyze_matches(entries: list[dict]) -> list[dict]:
     """
-    Send live match entries to the selected LLM for anomaly detection.
+    Send live match entries to MiniMax-M2.7 for anomaly detection.
 
     Detects:
       DUPLICATE       – same real match listed twice (incl. sides swapped / name formats)
       PLAYER_CONFLICT – same player in two different live matches simultaneously
 
     Returns list of issue dicts with 0-based match_indices.
-    provider: "claude" | "deepseek"
     """
     if len(entries) < 2:
         return []
@@ -484,15 +460,9 @@ async def ai_analyze_matches(
     prompt = _build_ai_prompt(entries)
 
     try:
-        if provider == "claude":
-            text = await _call_claude(aclient, prompt)
-        elif provider == "deepseek":
-            text = await _call_deepseek(prompt)
-        else:
-            print(f"[AI] Unknown provider: {provider!r}")
-            return []
+        text = await _call_minimax(prompt)
     except Exception as exc:
-        print(f"[AI] {provider} call error: {exc}")
+        print(f"[AI] MiniMax call error: {exc}")
         return []
 
     return _parse_ai_response(text, entries)
@@ -945,29 +915,17 @@ async def main() -> None:
         print(f"[*] Loaded {len(alerted_pairs)} previously alerted pair(s) from disk.")
 
     # ── AI provider setup ──────────────────────────────────────────────
-    aclient:     anthropic.AsyncAnthropic | None = None
-    ai_provider: str | None                      = None
+    ai_enabled: bool = False
 
     if AI_ANALYSIS:
-        if LLM_PROVIDER == "claude":
-            if ANTHROPIC_API_KEY:
-                aclient     = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-                ai_provider = "claude"
-                print("[*] AI analysis enabled – Claude Haiku 4.5.")
-            else:
-                print("[!] LLM_PROVIDER=claude but ANTHROPIC_API_KEY not set – AI disabled.")
-        elif LLM_PROVIDER == "deepseek":
-            if DEEPSEEK_API_KEY:
-                ai_provider = "deepseek"
-                print("[*] AI analysis enabled – DeepSeek R1.")
-            else:
-                print("[!] LLM_PROVIDER=deepseek but DEEPSEEK_API_KEY not set – AI disabled.")
+        if MINIMAX_API_KEY:
+            ai_enabled = True
+            print("[*] AI analysis enabled – MiniMax-M2.7.")
         else:
-            print(f"[!] Unknown LLM_PROVIDER={LLM_PROVIDER!r}. Use 'claude' or 'deepseek'.")
+            print("[!] AI_ANALYSIS=true but MINIMAX_API_KEY not set – AI disabled.")
 
     # ── Send startup ping BEFORE browser loads ────────────────────────
-    _provider_labels = {"claude": "Claude Haiku 4.5", "deepseek": "DeepSeek R1"}
-    ai_status = f"{_provider_labels.get(ai_provider, '')} ✓" if ai_provider else "rule-based only"
+    ai_status = "MiniMax-M2.7 ✓" if ai_enabled else "rule-based only"
     await send_telegram(
         f"🟢 <b>Tennis duplicate monitor starting…</b>\n"
         f"AI analysis: <b>{ai_status}</b>\n"
@@ -1079,10 +1037,9 @@ async def main() -> None:
                         print("    No duplicates detected in this cycle.")
 
                     # ── AI analysis ───────────────────────────────────────────
-                    if ai_provider:
-                        label = _provider_labels.get(ai_provider, ai_provider)
-                        print(f"\n[AI] Running batch analysis ({label})…")
-                        ai_issues = await ai_analyze_matches(live_entries, ai_provider, aclient)
+                    if ai_enabled:
+                        print(f"\n[AI] Running batch analysis (MiniMax-M2.7)…")
+                        ai_issues = await ai_analyze_matches(live_entries)
 
                         new_ai = []
                         for issue in ai_issues:
@@ -1123,13 +1080,12 @@ async def main() -> None:
                                 if not should_alert:
                                     continue
 
-                                ai_tag = _provider_labels.get(ai_provider, ai_provider)
                                 if kind == "PLAYER_CONFLICT":
                                     emoji      = "⚠️"
-                                    type_label = f"Player conflict detected! ({ai_tag})"
+                                    type_label = "Player conflict detected! (MiniMax-M2.7)"
                                 else:  # DUPLICATE
                                     emoji      = "🎾"
-                                    type_label = f"Possible duplicate tennis match! ({ai_tag})"
+                                    type_label = "Possible duplicate tennis match! (MiniMax-M2.7)"
 
                                 report_note = f"\n\nReport saved: {report_path}" if report_path else ""
                                 msg = (
