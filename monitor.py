@@ -395,6 +395,8 @@ def _build_ai_prompt(entries: list[dict]) -> str:
 
 def _parse_ai_response(text: str, entries: list[dict]) -> list[dict]:
     """Extract and validate issues from raw LLM JSON response (shared by all providers)."""
+    # Strip <think>...</think> reasoning blocks (MiniMax-M2.7 emits these)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     start = text.find("{")
     end   = text.rfind("}") + 1
     if start == -1 or end <= start:
