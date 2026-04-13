@@ -41,7 +41,7 @@ Optional .env keys:
   MIN_SIDE_SCORE       – rule-based per-side floor (default: 0.60)
   HEADLESS             – run browser headless (default: true)
   AI_ANALYSIS          – enable LLM analysis layer (default: true)
-  MINIMAX_API_KEY      – required when AI_ANALYSIS=true (MiniMax-M2.7)
+  DEEPSEEK_API_KEY      – required when AI_ANALYSIS=true (DeepSeek)
 """
 
 import asyncio
@@ -56,6 +56,11 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Page
+from delay_detector import (
+    check_score_delays,
+    extract_dafabet_scores,
+    FLASHSCORE_LIVE_URL,
+)
 
 # ── Load secrets from .env (never commit .env to git) ─────────────
 load_dotenv()
@@ -96,8 +101,14 @@ HEADLESS: bool = os.getenv("HEADLESS", "true").lower() in ("1", "true", "yes")
 # Enable AI analysis layer (default: true)
 AI_ANALYSIS: bool = os.getenv("AI_ANALYSIS", "true").lower() in ("1", "true", "yes")
 
-# MiniMax API key – required when AI_ANALYSIS=true
-MINIMAX_API_KEY: str = os.getenv("MINIMAX_API_KEY", "")
+# DeepSeek API key – required when AI_ANALYSIS=true
+DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+
+# Enable score delay detection via Flashscore.mobi (default: true)
+DELAY_DETECTION: bool = os.getenv("DELAY_DETECTION", "true").lower() in ("1", "true", "yes")
+
+# Heartbeat interval in seconds (default: 3600 = every hour)
+HEARTBEAT_INTERVAL: int = int(os.getenv("HEARTBEAT_INTERVAL", "3600"))
 
 # Tennis live page URL
 TENNIS_URL: str = "https://sports.dafabet.com/en/live/sport/239-TENN"
@@ -395,7 +406,7 @@ def _build_ai_prompt(entries: list[dict]) -> str:
 
 def _parse_ai_response(text: str, entries: list[dict]) -> list[dict]:
     """Extract and validate issues from raw LLM JSON response (shared by all providers)."""
-    # Strip <think>...</think> reasoning blocks (MiniMax-M2.7 emits these)
+    # Strip <think>...</think> reasoning blocks (some models emit these)
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     start = text.find("{")
     end   = text.rfind("}") + 1
@@ -425,20 +436,20 @@ def _parse_ai_response(text: str, entries: list[dict]) -> list[dict]:
     return issues
 
 
-async def _call_minimax(prompt: str) -> str:
-    """Call MiniMax-M2.7 via its OpenAI-compatible API and return the text response."""
+async def _call_deepseek(prompt: str) -> str:
+    """Call DeepSeek via its OpenAI-compatible API and return the text response."""
     headers = {
-        "Authorization": f"Bearer {MINIMAX_API_KEY}",
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type":  "application/json",
     }
     payload = {
-        "model":      "MiniMax-M2.7",
+        "model":      "deepseek-chat",
         "messages":   [{"role": "user", "content": prompt}],
         "max_tokens": 1024,
     }
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
-            "https://api.minimax.io/v1/chat/completions",
+            "https://api.deepseek.com/chat/completions",
             headers=headers,
             json=payload,
         )
@@ -448,7 +459,7 @@ async def _call_minimax(prompt: str) -> str:
 
 async def ai_analyze_matches(entries: list[dict]) -> list[dict]:
     """
-    Send live match entries to MiniMax-M2.7 for anomaly detection.
+    Send live match entries to DeepSeek for anomaly detection.
 
     Detects:
       DUPLICATE       – same real match listed twice (incl. sides swapped / name formats)
@@ -462,9 +473,9 @@ async def ai_analyze_matches(entries: list[dict]) -> list[dict]:
     prompt = _build_ai_prompt(entries)
 
     try:
-        text = await _call_minimax(prompt)
+        text = await _call_deepseek(prompt)
     except Exception as exc:
-        print(f"[AI] MiniMax call error: {exc}")
+        print(f"[AI] DeepSeek call error: {exc}")
         return []
 
     return _parse_ai_response(text, entries)
@@ -616,14 +627,6 @@ async def send_telegram(text: str) -> None:
                 print(f"[Telegram] {chat_id}: error: {exc}")
 
 
-def _seconds_until_next_7am_utc() -> float:
-    """Return seconds until the next 07:00 UTC."""
-    now = datetime.now(timezone.utc)
-    target = now.replace(hour=7, minute=0, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return (target - now).total_seconds()
-
 
 async def heartbeat_loop(
     started_at:      datetime,
@@ -635,9 +638,8 @@ async def heartbeat_loop(
     After the heartbeat, flush any anomaly reports accumulated since last heartbeat.
     Runs as a background asyncio task alongside the main polling loop.
     """
-    wait = _seconds_until_next_7am_utc()
-    print(f"[heartbeat] Next heartbeat in {wait / 3600:.1f}h (07:00 UTC).")
-    await asyncio.sleep(wait)
+    print(f"[heartbeat] Heartbeat every {HEARTBEAT_INTERVAL}s ({HEARTBEAT_INTERVAL // 60}min).")
+    await asyncio.sleep(HEARTBEAT_INTERVAL)
 
     while True:
         uptime_secs = int((datetime.now(timezone.utc) - started_at).total_seconds())
@@ -698,10 +700,8 @@ async def heartbeat_loop(
                 await send_telegram(report_msg)
                 print(f"[heartbeat] Sent report: {r['file']}")
 
-        # Sleep until next 07:00 UTC (accounts for drift)
-        wait = _seconds_until_next_7am_utc()
-        print(f"[heartbeat] Next heartbeat in {wait / 3600:.1f}h.")
-        await asyncio.sleep(wait)
+        print(f"[heartbeat] Next heartbeat in {HEARTBEAT_INTERVAL // 60}min.")
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 
 # ── Anomaly investigation ──────────────────────────────────────────
@@ -912,6 +912,7 @@ async def investigate_and_decide(
 async def main() -> None:
     started_at       = datetime.now(timezone.utc)
     alerted_pairs    = load_alerted_pairs()
+    alerted_delays: set = set()   # tracks delay alerts to avoid re-sending
     pending_reports: list[dict] = []   # anomaly summaries queued for next heartbeat
     if alerted_pairs:
         print(f"[*] Loaded {len(alerted_pairs)} previously alerted pair(s) from disk.")
@@ -920,18 +921,20 @@ async def main() -> None:
     ai_enabled: bool = False
 
     if AI_ANALYSIS:
-        if MINIMAX_API_KEY:
+        if DEEPSEEK_API_KEY:
             ai_enabled = True
-            print("[*] AI analysis enabled – MiniMax-M2.7.")
+            print("[*] AI analysis enabled – DeepSeek.")
         else:
-            print("[!] AI_ANALYSIS=true but MINIMAX_API_KEY not set – AI disabled.")
+            print("[!] AI_ANALYSIS=true but DEEPSEEK_API_KEY not set – AI disabled.")
 
     # ── Send startup ping BEFORE browser loads ────────────────────────
-    ai_status = "MiniMax-M2.7 ✓" if ai_enabled else "rule-based only"
+    ai_status    = "DeepSeek ✓" if ai_enabled else "rule-based only"
+    delay_status = "Flashscore.mobi ✓" if DELAY_DETECTION else "disabled"
     await send_telegram(
         f"🟢 <b>Tennis duplicate monitor starting…</b>\n"
         f"AI analysis: <b>{ai_status}</b>\n"
-        f"Polling every {CHECK_INTERVAL}s · Heartbeat daily at 07:00 UTC\n"
+        f"Delay detection: <b>{delay_status}</b>\n"
+        f"Polling every {CHECK_INTERVAL}s · Heartbeat every {HEARTBEAT_INTERVAL // 60}min\n"
         f"Started at: {started_at.strftime('%Y-%m-%d %H:%M UTC')}"
     )
 
@@ -957,7 +960,8 @@ async def main() -> None:
 
         print(f"[*] Starting tennis duplicate detector. Polling every {CHECK_INTERVAL}s.")
         print(f"[*] Similarity threshold: {SIMILARITY_THRESHOLD}  |  Min per-side: {MIN_SIDE_SCORE}")
-        print(f"[*] Heartbeat: daily at 07:00 UTC")
+        print(f"[*] Heartbeat: every {HEARTBEAT_INTERVAL // 60}min")
+        print(f"[*] Delay detection: {'ON (flashscore.mobi)' if DELAY_DETECTION else 'OFF'}")
         print(f"[*] URL: {TENNIS_URL}\n")
 
         # ── Launch heartbeat as a background task ─────────────────────
@@ -1040,7 +1044,7 @@ async def main() -> None:
 
                     # ── AI analysis ───────────────────────────────────────────
                     if ai_enabled:
-                        print(f"\n[AI] Running batch analysis (MiniMax-M2.7)…")
+                        print(f"\n[AI] Running batch analysis (DeepSeek)…")
                         ai_issues = await ai_analyze_matches(live_entries)
 
                         new_ai = []
@@ -1084,10 +1088,10 @@ async def main() -> None:
 
                                 if kind == "PLAYER_CONFLICT":
                                     emoji      = "⚠️"
-                                    type_label = "Player conflict detected! (MiniMax-M2.7)"
+                                    type_label = "Player conflict detected! (DeepSeek)"
                                 else:  # DUPLICATE
                                     emoji      = "🎾"
-                                    type_label = "Possible duplicate tennis match! (MiniMax-M2.7)"
+                                    type_label = "Possible duplicate tennis match! (DeepSeek)"
 
                                 report_note = f"\n\nReport saved: {report_path}" if report_path else ""
                                 msg = (
@@ -1104,6 +1108,34 @@ async def main() -> None:
                             save_alerted_pairs(alerted_pairs)
                         else:
                             print("[AI] No new issues detected.")
+
+                    # ── Score delay detection (Flashscore.mobi) ───────────
+                    if DELAY_DETECTION and live_entries:
+                        try:
+                            # Extract detailed scores from each Dafabet match page
+                            scored_entries = await extract_dafabet_scores(context, live_entries)
+
+                            # Compare against Flashscore.mobi (sets, games, points)
+                            delay_alerts = await check_score_delays(
+                                context, scored_entries, alerted_delays
+                            )
+
+                            for da in delay_alerts:
+                                await send_telegram(da["alert_msg"])
+                                print(f"[delay] Alert sent for: "
+                                      f"{da['dafabet_entry']['home']} vs "
+                                      f"{da['dafabet_entry']['away']}")
+
+                            # Expire delay alerts for matches no longer live
+                            expired_delays = {
+                                k for k in alerted_delays
+                                if k[0] not in current_urls
+                            }
+                            if expired_delays:
+                                alerted_delays -= expired_delays
+
+                        except Exception as exc:
+                            print(f"[delay] Error during delay check: {exc}")
 
                 print(f"\n--- sleeping {CHECK_INTERVAL}s ---\n")
                 await asyncio.sleep(CHECK_INTERVAL)
