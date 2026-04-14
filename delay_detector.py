@@ -951,3 +951,752 @@ async def check_score_delays(
               f"Flashscore Set {fs_current} [{fs_score_str}]")
 
     return alerts
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  BWIN reference source
+# ═══════════════════════════════════════════════════════════════════
+#
+# Mirrors the Flashscore.mobi pipeline but uses bwin.com as the reference
+# clock for detecting Dafabet lag. bwin's live page uses a WebSocket
+# (wss://cds-push.bwin.com) to keep the DOM continuously fresh — so we keep
+# ONE persistent page open across the whole session and just re-read the DOM
+# each cycle. No reloads needed.
+#
+# Two-cycle debounce (user requirement): a delay must be observed on TWO
+# consecutive polling cycles for the same Dafabet match before it fires an
+# alert. First-cycle observations sit in `bwin_delay_pending`; if the delay
+# is still present on the next cycle → alert.
+#
+# Only SET_DELAY and GAME_DELAY are honoured from the bwin source (point-level
+# noise is suppressed per design decision — sub-game flicker is normal).
+# ═══════════════════════════════════════════════════════════════════
+
+BWIN_LIVE_URL = "https://www.bwin.com/en/sports/live/tennis-5"
+BWIN_EVENT_BASE = "https://www.bwin.com"
+
+
+async def fetch_bwin_live(page) -> list[dict]:
+    """
+    Read the current bwin live tennis DOM and return parsed match states.
+
+    Accepts a *persistent* page — if the page is already on BWIN_LIVE_URL,
+    no navigation happens; we just re-read the DOM (the bwin WebSocket keeps
+    it live). First call navigates; subsequent calls just re-read.
+
+    Returned shape mirrors `fetch_flashscore_live` so `detect_delay` works
+    unchanged:
+        {
+            "player1":       "James Trotter",
+            "player2":       "Jake Delaney",
+            "country1":      "JPN",
+            "country2":      "AUS",
+            "current_set":   3,
+            "sets_p1":       1,
+            "sets_p2":       1,
+            "game_scores":   [(4, 0)],      # current set only (bwin listing
+                                            # exposes only the current set)
+            "point_score":   ("15", "0"),   # or None
+            "match_url":     "https://www.bwin.com/en/sports/events/...",
+            "event_id":      "19376970",
+            "raw_text":      "<innerText dump>",
+        }
+    """
+    try:
+        if BWIN_LIVE_URL not in (page.url or ""):
+            await page.goto(BWIN_LIVE_URL, wait_until="domcontentloaded", timeout=30_000)
+            await page.wait_for_timeout(8_000)
+            # Dismiss cookie banner on first load
+            for label in ("Allow All", "Accept All", "Accept"):
+                try:
+                    btn = page.get_by_role("button", name=label)
+                    if await btn.count():
+                        await btn.first.click(timeout=2_000)
+                        break
+                except Exception:
+                    pass
+
+            # bwin's SPA lazy-loads the live event list — scroll to the
+            # bottom and back to trigger rendering of all ms-event nodes,
+            # then wait for the count to stabilise. First-fetch only.
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(1_500)
+                await page.evaluate("window.scrollTo(0, 0)")
+                await page.wait_for_timeout(1_500)
+
+                prev_count = -1
+                for _ in range(6):  # up to ~9s of stabilisation polling
+                    cur_count = await page.locator("ms-event").count()
+                    if cur_count == prev_count and cur_count > 0:
+                        break
+                    prev_count = cur_count
+                    await page.wait_for_timeout(1_500)
+            except Exception as exc:
+                print(f"[bwin] hydration wait failed (continuing): {exc}")
+        else:
+            # Persistent page — just give the WebSocket a brief moment to
+            # settle any in-flight DOM updates before we read.
+            await page.wait_for_timeout(500)
+
+        records = await page.eval_on_selector_all(
+            "ms-event",
+            """
+            els => els.map(el => {
+                const a = el.querySelector('a[href*="/sports/events/"]');
+                const href = a ? a.getAttribute('href') : '';
+                const participants = [...el.querySelectorAll('.participant')];
+                const parsePart = p => {
+                    const cc = p.querySelector('.participant-country');
+                    const ccText = cc ? cc.innerText.trim() : '';
+                    let name = (p.innerText || '').trim();
+                    if (ccText) {
+                        // Remove the CC text (span sits inline inside .participant)
+                        name = name.replace(ccText, '').trim();
+                    }
+                    return {name, cc: ccText};
+                };
+                const p1 = participants[0] ? parsePart(participants[0]) : {name:'', cc:''};
+                const p2 = participants[1] ? parsePart(participants[1]) : {name:'', cc:''};
+                return {
+                    href: href,
+                    player1: p1.name,
+                    player2: p2.name,
+                    cc1: p1.cc,
+                    cc2: p2.cc,
+                    text: el.innerText || '',
+                };
+            })
+            """
+        )
+    except Exception as exc:
+        print(f"[bwin] fetch error: {exc}")
+        return []
+
+    matches: list[dict] = []
+    for r in records:
+        parsed = _parse_bwin_event(r)
+        if parsed is not None:
+            matches.append(parsed)
+    return matches
+
+
+def _parse_bwin_event(raw: dict) -> dict | None:
+    """
+    Parse a single ms-event's innerText + href into a structured dict.
+
+    bwin innerText layout (confirmed from probe — all newline-separated after
+    split, in source order):
+
+        James Trotter JPN          (name + country on one line)
+        Jake Delaney AUS
+        LIVE                        (status)
+        3rd Set                     (current-set label)
+        15                          (point-home)
+        0                           (point-away)
+        P                           (label)
+        4                           (games-home in current set)
+        0                           (games-away in current set)
+        G                           (label)
+        1                           (sets-won-home)
+        1                           (sets-won-away)
+        Sets                        (label)
+        ...odds rows...
+
+    Strategy: walk backwards from labels "Sets", "G", "P" to pick the two
+    preceding numeric lines. This is resilient to extra odds lines appearing
+    before/after. Returns None if the match isn't LIVE.
+    """
+    text = raw.get("text", "") or ""
+    if "LIVE" not in text:
+        return None
+
+    href = raw.get("href", "") or ""
+    if not href:
+        return None
+
+    # Event ID: trailing digits in the slug, e.g. .../james-trotter-...-19376970
+    m_id = re.search(r"(\d+)\s*$", href.rstrip("/"))
+    event_id = m_id.group(1) if m_id else href
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    def _find_label(label: str) -> int:
+        for i, ln in enumerate(lines):
+            if ln == label:
+                return i
+        return -1
+
+    def _as_int(s: str, default: int = 0) -> int:
+        try:
+            return int(s)
+        except Exception:
+            return default
+
+    sets_h = sets_a = 0
+    games_h = games_a = 0
+    point_home: str | None = None
+    point_away: str | None = None
+
+    idx_sets = _find_label("Sets")
+    if idx_sets >= 2:
+        sets_h = _as_int(lines[idx_sets - 2])
+        sets_a = _as_int(lines[idx_sets - 1])
+
+    idx_g = _find_label("G")
+    if idx_g >= 2:
+        games_h = _as_int(lines[idx_g - 2])
+        games_a = _as_int(lines[idx_g - 1])
+
+    idx_p = _find_label("P")
+    if idx_p >= 2:
+        ph = lines[idx_p - 2]
+        pa = lines[idx_p - 1]
+        if re.fullmatch(r"(0|15|30|40|A|AD)", ph, re.I):
+            point_home = ph.upper().replace("A", "AD") if ph.upper() == "A" else ph.upper()
+        if re.fullmatch(r"(0|15|30|40|A|AD)", pa, re.I):
+            point_away = pa.upper().replace("A", "AD") if pa.upper() == "A" else pa.upper()
+
+    # Current set from "Nth Set" label if present
+    current_set = 0
+    for ln in lines:
+        mset = re.match(r"(\d+)\s*(st|nd|rd|th)\s*Set", ln, re.I)
+        if mset:
+            current_set = int(mset.group(1))
+            break
+    if current_set == 0:
+        current_set = sets_h + sets_a + 1  # fallback
+
+    bwin_url = href if href.startswith("http") else BWIN_EVENT_BASE + href
+
+    return {
+        "player1":     raw.get("player1", "").strip(),
+        "player2":     raw.get("player2", "").strip(),
+        "country1":    raw.get("cc1", "").strip(),
+        "country2":    raw.get("cc2", "").strip(),
+        "current_set": current_set,
+        "sets_p1":     sets_h,
+        "sets_p2":     sets_a,
+        # bwin listing only exposes the current set — provide a one-element
+        # list so detect_delay's _current_set_games() picks it up correctly.
+        "game_scores": [(games_h, games_a)],
+        "point_score": (point_home, point_away) if point_home and point_away else None,
+        "match_url":   bwin_url,
+        "event_id":    event_id,
+        "raw_text":    text,
+    }
+
+
+def bwin_player_similarity(dafabet_name: str, bwin_name: str) -> float:
+    """
+    Similarity between a Dafabet name ('Surname, Given' / 'Surname I') and a
+    bwin name ('Given Surname' / 'Given Middle Surname').
+
+    The generic `cross_platform_player_similarity` fails here because its
+    `_extract_surname()` assumes "first token = surname" for no-comma names
+    — which is correct for Flashscore ("Zverev A.") but WRONG for bwin
+    ("Marat Sharipov"), where the first token is the GIVEN name.
+
+    Strategy:
+      1. Extract the Dafabet surname (possibly compound, e.g. "Torner Sensano")
+         and first-initial.
+      2. Find each surname word as a fuzzy match against some bwin token.
+      3. If every surname word is accounted for, require the Dafabet initial
+         to match the first letter of some remaining bwin token — then 0.95.
+         If initials differ → 0.50 (likely same surname, different player).
+      4. If surname words can't all be located → fall back to whole-string
+         fuzzy so near-spellings still get some credit.
+
+    Handles the observed cases correctly:
+      'Sharipov, Marat'          ↔ 'Marat Sharipov'              → 0.95
+      'Torner Sensano, Neus'     ↔ 'Neus Torner Sensano'         → 0.95
+      'Alexandrescou, Yannick T' ↔ 'Yannick Theodor Alexandrescou'→ 0.95
+      'Funk, A'                  ↔ 'Aaron Funk'                  → 0.95
+      'Kwon, Soon Woo'           ↔ 'Marat Sharipov'              → ~0.15
+    """
+    dafa_surname = _extract_surname(dafabet_name)
+    dafa_initial = _extract_initial(dafabet_name)
+
+    bw_clean = _ascii_lower(bwin_name).replace(".", "").replace(",", " ")
+    bw_tokens = [t for t in bw_clean.split() if t]
+
+    if not dafa_surname or not bw_tokens:
+        return _fuzzy(
+            _ascii_lower(dafabet_name).replace(",", " "),
+            bw_clean,
+        )
+
+    # Multi-word surname: ALL words must be found as distinct bwin tokens.
+    surname_words = dafa_surname.split()
+    used: set[int] = set()
+    for word in surname_words:
+        best_i = -1
+        best_sim = 0.0
+        for i, tok in enumerate(bw_tokens):
+            if i in used:
+                continue
+            sim = _fuzzy(word, tok)
+            if sim > best_sim:
+                best_sim = sim
+                best_i = i
+        if best_sim < 0.80 or best_i < 0:
+            # Surname word not confidently located in bwin — fall back.
+            return max(
+                _fuzzy(
+                    _ascii_lower(dafabet_name).replace(",", " "),
+                    bw_clean,
+                ),
+                best_sim * 0.55,
+            )
+        used.add(best_i)
+
+    # Every surname word matched in bwin. Check the first-name initial against
+    # the unmatched bwin tokens (which should be given names / middle names).
+    unmatched = [t for i, t in enumerate(bw_tokens) if i not in used and t]
+
+    if not dafa_initial:
+        # No initial to verify — strong surname match alone is still good.
+        return 0.88
+
+    if not unmatched:
+        # Bwin had nothing but the surname tokens — unusual, give moderate score.
+        return 0.80
+
+    given_initials = {t[0] for t in unmatched if t}
+    if dafa_initial in given_initials:
+        return 0.95  # surname + initial confirmed
+    return 0.50      # same surname, different initial = likely different player
+
+
+def match_dafabet_to_bwin(
+    dafabet_entry: dict,
+    bwin_matches:  list[dict],
+    threshold:     float = 0.75,
+) -> dict | None:
+    """
+    Find the best bwin match for a Dafabet entry using `bwin_player_similarity`
+    (bwin-aware; handles "Given Surname" token order).
+
+    Threshold 0.75 is calibrated against the stronger similarity signal —
+    confirmed surname + matching initial scores 0.95, so 0.75 keeps comfortable
+    headroom while rejecting noise. Doubles matches are skipped (bwin name
+    format for doubles differs and cross-matching is too noisy).
+    """
+    dafa_home = dafabet_entry["home"]
+    dafa_away = dafabet_entry["away"]
+
+    if "/" in dafa_home or "/" in dafa_away:
+        return None
+
+    best_match = None
+    best_score = 0.0
+    best_min_side = 0.0
+
+    for bw in bwin_matches:
+        if "/" in bw["player1"] or "/" in bw["player2"]:
+            continue
+
+        sim_h1 = bwin_player_similarity(dafa_home, bw["player1"])
+        sim_a2 = bwin_player_similarity(dafa_away, bw["player2"])
+        score_normal = (sim_h1 + sim_a2) / 2
+
+        sim_h2 = bwin_player_similarity(dafa_home, bw["player2"])
+        sim_a1 = bwin_player_similarity(dafa_away, bw["player1"])
+        score_reversed = (sim_h2 + sim_a1) / 2
+
+        if score_normal >= score_reversed:
+            score    = score_normal
+            min_side = min(sim_h1, sim_a2)
+        else:
+            score    = score_reversed
+            min_side = min(sim_h2, sim_a1)
+
+        # Both sides must score well — prevents one-sided false matches.
+        if score > best_score and min_side >= 0.60:
+            best_score    = score
+            best_min_side = min_side
+            best_match    = bw
+
+    if best_score >= threshold:
+        print(f"[bwin] Matched: '{dafa_home} vs {dafa_away}' ↔ "
+              f"'{best_match['player1']} vs {best_match['player2']}' "
+              f"(sim={best_score:.2f})")
+        return best_match
+
+    if best_match and best_score >= 0.55:
+        print(f"[bwin] Near miss: '{dafa_home} vs {dafa_away}' ↔ "
+              f"'{best_match['player1']} vs {best_match['player2']}' "
+              f"(sim={best_score:.2f}, threshold={threshold})")
+    return None
+
+
+async def check_bwin_delays(
+    bwin_matches:        list[dict],
+    dafabet_entries:     list[dict],
+    alerted_bwin_delays: set,
+    bwin_delay_pending:  dict,
+) -> list[dict]:
+    """
+    Cross-check Dafabet state against bwin (reference clock) and return alerts
+    for matches where Dafabet is lagging.
+
+    Two-cycle debounce:
+        Cycle N:   first observation of a lag on a given Dafabet match → entry
+                   added to `bwin_delay_pending[url] = delay_info` and NO alert
+                   is fired.
+        Cycle N+1: if the Dafabet match is *still* lagging (same or larger
+                   delay), an alert fires. If Dafabet caught up, the pending
+                   entry is cleared silently (false alarm).
+
+    Only SET_DELAY and GAME_DELAY trigger alerts from bwin — POINT_DELAY is
+    intentionally suppressed per design (sub-game flicker is too noisy for
+    a cross-source reference check).
+
+    Args:
+        bwin_matches:        pre-fetched bwin live matches (from fetch_bwin_live).
+                             Passed in by the caller so the same list can be
+                             reused for heartbeat snapshots without re-fetching.
+        dafabet_entries:     Dafabet live entries already enriched with scores
+                             by `extract_dafabet_scores`
+        alerted_bwin_delays: set of alert keys already sent (dedup across time)
+        bwin_delay_pending:  dict[dafa_url → delay_info] — first-cycle candidates
+                             awaiting confirmation. Caller owns this dict and
+                             retains it across cycles.
+
+    Returns:
+        list of alert dicts with 'alert_msg' ready for send_telegram().
+    """
+    if not dafabet_entries or not bwin_matches:
+        if not bwin_matches:
+            print("[bwin] No live matches parsed from bwin.")
+        return []
+
+    print(f"[bwin] {len(bwin_matches)} live match(es) on bwin, "
+          f"{len(dafabet_entries)} on Dafabet")
+
+    alerts: list[dict] = []
+    seen_urls_this_cycle: set[str] = set()
+
+    for dafa in dafabet_entries:
+        if "/" in dafa.get("home", "") or "/" in dafa.get("away", ""):
+            continue
+
+        bw = match_dafabet_to_bwin(dafa, bwin_matches)
+        if not bw:
+            continue
+
+        dafa_url = dafa["url"]
+        seen_urls_this_cycle.add(dafa_url)
+
+        dafa_current = dafa.get("current_set", 1)
+        dafa_games   = dafa.get("game_scores", [])
+        dafa_sets    = (dafa.get("sets_home", 0), dafa.get("sets_away", 0))
+
+        # ── Sanity check: Dafabet score extraction is known-brittle and
+        # sometimes parses odds/IDs as set/game numbers (e.g. sets=80-4,
+        # games=(40,40)). Reject impossible tennis states so we don't fire
+        # phantom delay alerts. Real tennis: best of 5 → max 3 sets per side,
+        # games per set max ~13 (tiebreak or 12-12 in some formats).
+        if dafa_sets[0] > 5 or dafa_sets[1] > 5 or dafa_current > 5:
+            print(f"[bwin] Skipping {dafa['home']} vs {dafa['away']} — "
+                  f"Dafabet score implausible (sets={dafa_sets}, "
+                  f"set={dafa_current}); likely parse error upstream.")
+            continue
+        implausible_games = any(
+            (not isinstance(g, (tuple, list)))
+            or len(g) < 2
+            or g[0] > 20 or g[1] > 20
+            or g[0] < 0 or g[1] < 0
+            for g in dafa_games
+        )
+        if implausible_games:
+            print(f"[bwin] Skipping {dafa['home']} vs {dafa['away']} — "
+                  f"Dafabet game scores implausible ({dafa_games}); "
+                  f"likely parse error upstream.")
+            continue
+
+        bw_current = bw["current_set"]
+        bw_games   = bw["game_scores"]
+        bw_sets    = (bw["sets_p1"], bw["sets_p2"])
+
+        # Ignore point level — pass None to detect_delay so POINT_DELAY is
+        # never returned from the bwin path.
+        delay = detect_delay(
+            dafabet_current_set=dafa_current,
+            dafabet_games=dafa_games,
+            flashscore_current_set=bw_current,
+            flashscore_games=bw_games,
+            dafabet_sets_won=dafa_sets,
+            flashscore_sets_won=bw_sets,
+            dafabet_points=None,
+            flashscore_points=None,
+        )
+
+        if not delay or delay["type"] == "POINT_DELAY":
+            # No lag (or sub-game noise) — clear any stale pending entry.
+            if dafa_url in bwin_delay_pending:
+                print(f"[bwin] Delay cleared for {dafa['home']} vs {dafa['away']} "
+                      f"(pending entry dropped)")
+                bwin_delay_pending.pop(dafa_url, None)
+            continue
+
+        # Build stable alert key — includes delay magnitude so a growing
+        # delay can re-alert even after the first one.
+        if delay["type"] == "SET_DELAY":
+            alert_key = (dafa_url, "BWIN_SET", bw_current)
+        else:  # GAME_DELAY
+            fs_cg = delay.get("flashscore_current_game", (0, 0))
+            alert_key = (dafa_url, "BWIN_GAME", bw_current, fs_cg[0] + fs_cg[1])
+
+        # ── Two-cycle debounce ──
+        prev = bwin_delay_pending.get(dafa_url)
+        if prev is None:
+            # First observation this cycle — record and wait.
+            bwin_delay_pending[dafa_url] = {
+                "alert_key": alert_key,
+                "delay":     delay,
+                "bwin":      bw,
+            }
+            print(f"[bwin] Candidate delay (1st obs) for "
+                  f"{dafa['home']} vs {dafa['away']}: {delay['type']} — "
+                  f"will confirm next cycle")
+            continue
+
+        # Second observation — confirmed. (Any same-or-larger delay type
+        # counts; delay growing from GAME→SET also confirms.)
+        if alert_key in alerted_bwin_delays:
+            # Already alerted at this magnitude — refresh pending but stay quiet.
+            bwin_delay_pending[dafa_url] = {
+                "alert_key": alert_key,
+                "delay":     delay,
+                "bwin":      bw,
+            }
+            continue
+
+        alerted_bwin_delays.add(alert_key)
+        bwin_delay_pending[dafa_url] = {
+            "alert_key": alert_key,
+            "delay":     delay,
+            "bwin":      bw,
+        }
+
+        # ── Build alert message ──
+        da_score_str = ", ".join(f"{g[0]}-{g[1]}" for g in dafa_games) if dafa_games else "N/A"
+        bw_score_str = ", ".join(f"{g[0]}-{g[1]}" for g in bw_games)   if bw_games   else "N/A"
+
+        if delay["type"] == "SET_DELAY":
+            delay_desc = f"Dafabet is <b>{delay['set_diff']} set(s) behind bwin</b>"
+            emoji = "⏱️"
+        else:  # GAME_DELAY
+            da_cg = delay.get("dafabet_current_game", (0, 0))
+            bw_cg = delay.get("flashscore_current_game", (0, 0))
+            delay_desc = (
+                f"Dafabet is <b>{delay['game_diff']} game(s) behind bwin</b> "
+                f"in Set {bw_current}\n"
+                f"Dafabet game: {da_cg[0]}-{da_cg[1]} | "
+                f"bwin game: {bw_cg[0]}-{bw_cg[1]}"
+            )
+            emoji = "🎾"
+
+        cc_line = ""
+        if bw.get("country1") or bw.get("country2"):
+            cc_line = f" ({bw.get('country1', '?')} / {bw.get('country2', '?')})"
+
+        alert_msg = (
+            f"{emoji} <b>BWIN REFERENCE DELAY ANOMALY ({delay['type']})</b>\n"
+            f"<i>Confirmed over 2 consecutive cycles</i>\n\n"
+            f"<b>Match:</b> {dafa['home']} vs {dafa['away']}\n"
+            f"<b>bwin:</b> {bw['player1']} vs {bw['player2']}{cc_line}\n\n"
+            f"<b>Dafabet state:</b> Set {dafa_current} "
+            f"(Sets: {dafa_sets[0]}-{dafa_sets[1]}) "
+            f"Games: [{da_score_str}]\n"
+            f"<b>bwin state:</b>    Set {bw_current} "
+            f"(Sets: {bw_sets[0]}-{bw_sets[1]}) "
+            f"Games: [{bw_score_str}]\n\n"
+            f"<b>{delay_desc}</b>\n\n"
+            f"<a href='{dafa['url']}'>🔗 Open Dafabet (click to verify)</a>\n"
+            f"<a href='{bw['match_url']}'>🔗 Open bwin reference</a>"
+        )
+
+        alerts.append({
+            "alert_msg":     alert_msg,
+            "dafabet_entry": dafa,
+            "bwin_match":    bw,
+            "delay_info":    delay,
+        })
+
+        print(f"[bwin] {emoji} CONFIRMED {delay['type']}: "
+              f"{dafa['home']} vs {dafa['away']} — "
+              f"Dafabet Set {dafa_current} [{da_score_str}] vs "
+              f"bwin Set {bw_current} [{bw_score_str}]")
+
+    # ── Prune pending entries for matches we didn't see this cycle ──
+    # (match ended, player names changed on one side, etc. — forget them)
+    stale = [u for u in bwin_delay_pending if u not in seen_urls_this_cycle]
+    for u in stale:
+        bwin_delay_pending.pop(u, None)
+
+    return alerts
+
+
+# ── Heartbeat snapshot (Dafabet ↔ bwin summary for hourly report) ──
+
+def build_bwin_heartbeat_section(
+    bwin_matches:        list[dict],
+    dafabet_entries:     list[dict],
+    alerted_bwin_delays: set,
+    bwin_delay_pending:  dict,
+    max_chars:           int = 2500,
+) -> str:
+    """
+    Build a compact HTML section describing the current Dafabet↔bwin
+    cross-reference state. Called by the main polling loop once per cycle
+    and stored in a shared dict; the hourly heartbeat reads the last
+    rendered section verbatim.
+
+    Layout:
+        🔗 <b>bwin cross-reference</b>
+        Coverage: 21 / 38 Dafabet matched · 5 skipped (bad data)
+
+        ⏳ <b>Pending (awaiting 2nd-cycle confirm):</b>
+          • Fancutt, T vs El Feky, Karim
+            GAME_DELAY — bwin Set 2 (4-2) vs Dafabet Set 2 (2-2)
+
+        🔴 <b>Confirmed delays (active):</b>
+          • Maduzzi, Gaia vs Moccia, Carlotta
+            SET_DELAY — bwin Set 3 vs Dafabet Set 2
+
+    If there are no delays (pending or confirmed), shows
+    "✅ All cross-referenced matches in sync."
+
+    Output is truncated to roughly `max_chars` to fit alongside the
+    match-list in the Telegram heartbeat (4096-char cap).
+    """
+    if not dafabet_entries:
+        return (
+            "\n\n🔗 <b>bwin cross-reference:</b>\n"
+            "  No Dafabet live matches this cycle."
+        )
+    if not bwin_matches:
+        return (
+            "\n\n🔗 <b>bwin cross-reference:</b>\n"
+            "  bwin has no live matches / feed unavailable."
+        )
+
+    pending_rows: list[str] = []
+    confirmed_rows: list[str] = []
+    cross_matched = 0
+    skipped_invalid = 0
+
+    # Build stable alert-key helper (must mirror the one in check_bwin_delays
+    # so we can tell whether a pair was alerted or only pending).
+    def _alert_key(dafa_url: str, delay: dict, bw_current: int) -> tuple:
+        if delay["type"] == "SET_DELAY":
+            return (dafa_url, "BWIN_SET", bw_current)
+        fs_cg = delay.get("flashscore_current_game", (0, 0))
+        return (dafa_url, "BWIN_GAME", bw_current, fs_cg[0] + fs_cg[1])
+
+    for dafa in dafabet_entries:
+        if "/" in dafa.get("home", "") or "/" in dafa.get("away", ""):
+            continue
+
+        bw = match_dafabet_to_bwin(dafa, bwin_matches)
+        if not bw:
+            continue
+
+        cross_matched += 1
+
+        dafa_sets    = (dafa.get("sets_home", 0), dafa.get("sets_away", 0))
+        dafa_current = dafa.get("current_set", 1)
+        dafa_games   = dafa.get("game_scores", [])
+
+        # Same sanity filter as check_bwin_delays — skip entries whose
+        # Dafabet state is garbage so we don't report phantom delays.
+        if (dafa_sets[0] > 5 or dafa_sets[1] > 5 or dafa_current > 5):
+            skipped_invalid += 1
+            continue
+        bad_games = any(
+            (not isinstance(g, (tuple, list))) or len(g) < 2
+            or g[0] > 20 or g[1] > 20 or g[0] < 0 or g[1] < 0
+            for g in dafa_games
+        )
+        if bad_games:
+            skipped_invalid += 1
+            continue
+
+        bw_current = bw["current_set"]
+        bw_games   = bw["game_scores"]
+        bw_sets    = (bw["sets_p1"], bw["sets_p2"])
+
+        delay = detect_delay(
+            dafabet_current_set=dafa_current,
+            dafabet_games=dafa_games,
+            flashscore_current_set=bw_current,
+            flashscore_games=bw_games,
+            dafabet_sets_won=dafa_sets,
+            flashscore_sets_won=bw_sets,
+            dafabet_points=None,
+            flashscore_points=None,
+        )
+
+        if not delay or delay["type"] == "POINT_DELAY":
+            continue  # in-sync matches are not listed individually
+
+        bw_cg = delay.get("flashscore_current_game", (0, 0))
+        da_cg = delay.get("dafabet_current_game", (0, 0))
+
+        if delay["type"] == "SET_DELAY":
+            descr = (
+                f"SET_DELAY — bwin Set {bw_current} "
+                f"({bw_sets[0]}-{bw_sets[1]}) "
+                f"vs Dafabet Set {dafa_current} "
+                f"({dafa_sets[0]}-{dafa_sets[1]})"
+            )
+        else:  # GAME_DELAY
+            descr = (
+                f"GAME_DELAY — bwin Set {bw_current} "
+                f"({bw_cg[0]}-{bw_cg[1]}) "
+                f"vs Dafabet Set {dafa_current} "
+                f"({da_cg[0]}-{da_cg[1]})"
+            )
+
+        row = (
+            f"  • {dafa['home']} vs {dafa['away']}\n"
+            f"    {descr}"
+        )
+
+        key = _alert_key(dafa["url"], delay, bw_current)
+        if key in alerted_bwin_delays:
+            confirmed_rows.append(row)
+        else:
+            pending_rows.append(row)
+
+    header = (
+        f"\n\n🔗 <b>bwin cross-reference</b>\n"
+        f"  Coverage: {cross_matched} / {len(dafabet_entries)} "
+        f"Dafabet matched"
+    )
+    if skipped_invalid:
+        header += f" · {skipped_invalid} skipped (bad data)"
+
+    if not pending_rows and not confirmed_rows:
+        section = f"{header}\n  ✅ All cross-referenced matches in sync."
+    else:
+        body_parts: list[str] = []
+        if pending_rows:
+            body_parts.append(
+                "\n⏳ <b>Pending (awaiting 2nd-cycle confirm):</b>\n"
+                + "\n".join(pending_rows)
+            )
+        if confirmed_rows:
+            body_parts.append(
+                "\n🔴 <b>Confirmed delays (active):</b>\n"
+                + "\n".join(confirmed_rows)
+            )
+        section = header + "".join(body_parts)
+
+    # Hard cap so the heartbeat stays under Telegram's 4096-char limit
+    # even with a long match list appended by heartbeat_loop.
+    if len(section) > max_chars:
+        section = section[: max_chars - 15] + "\n  […truncated]"
+    return section

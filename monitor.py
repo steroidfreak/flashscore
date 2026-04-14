@@ -60,6 +60,10 @@ from delay_detector import (
     check_score_delays,
     extract_dafabet_scores,
     FLASHSCORE_LIVE_URL,
+    check_bwin_delays,
+    BWIN_LIVE_URL,
+    build_bwin_heartbeat_section,
+    fetch_bwin_live,
 )
 
 # ── Load secrets from .env (never commit .env to git) ─────────────
@@ -106,6 +110,12 @@ MINIMAX_API_KEY: str = os.getenv("MINIMAX_API_KEY", "")
 
 # Enable score delay detection via Flashscore.mobi (default: true)
 DELAY_DETECTION: bool = os.getenv("DELAY_DETECTION", "true").lower() in ("1", "true", "yes")
+
+# Enable bwin cross-reference delay detection (default: true).
+# Opens a persistent tab on https://www.bwin.com/en/sports/live/tennis-5 and
+# uses bwin's WebSocket-pushed DOM as the reference clock. Alerts are fired
+# only after a lag is observed on two consecutive polling cycles.
+BWIN_DELAY_DETECTION: bool = os.getenv("BWIN_DELAY_DETECTION", "true").lower() in ("1", "true", "yes")
 
 # Heartbeat interval in seconds (default: 3600 = every hour)
 HEARTBEAT_INTERVAL: int = int(os.getenv("HEARTBEAT_INTERVAL", "3600"))
@@ -632,11 +642,20 @@ async def heartbeat_loop(
     started_at:      datetime,
     current_matches: list[dict],
     pending_reports: list[dict],
+    bwin_state:      dict,
 ) -> None:
     """
-    Send a Telegram 'still alive' message every day at 07:00 UTC.
-    After the heartbeat, flush any anomaly reports accumulated since last heartbeat.
-    Runs as a background asyncio task alongside the main polling loop.
+    Send a Telegram 'still alive' message every HEARTBEAT_INTERVAL seconds
+    (default: hourly). Includes:
+      • uptime + current UTC time
+      • current live matches (list from shared `current_matches`)
+      • anomaly count accumulated since last heartbeat
+      • bwin cross-reference snapshot: coverage + any Dafabet↔bwin delays
+
+    After the heartbeat, flushes any anomaly reports accumulated since last
+    heartbeat. Runs as a background asyncio task alongside the main polling
+    loop; the main loop owns `current_matches`, `pending_reports` and
+    `bwin_state` and mutates them in place each cycle.
     """
     print(f"[heartbeat] Heartbeat every {HEARTBEAT_INTERVAL}s ({HEARTBEAT_INTERVAL // 60}min).")
     await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -663,14 +682,40 @@ async def heartbeat_loop(
             if n_reports else "\n\n📋 No anomalies since last heartbeat."
         )
 
+        # bwin cross-reference section (populated by the main loop each cycle).
+        # If bwin detection is disabled or hasn't run yet, the section is empty
+        # and we show a placeholder so the heartbeat still acknowledges it.
+        bwin_html = bwin_state.get("section_html", "") or ""
+        bwin_updated_at = bwin_state.get("updated_at")
+        if bwin_html:
+            age_line = ""
+            if bwin_updated_at is not None:
+                age_s = int((datetime.now(timezone.utc) - bwin_updated_at).total_seconds())
+                age_line = f"  <i>(snapshot age: {age_s}s)</i>\n"
+            bwin_section = bwin_html + (f"\n{age_line}" if age_line else "")
+        elif BWIN_DELAY_DETECTION:
+            bwin_section = (
+                "\n\n🔗 <b>bwin cross-reference:</b>\n"
+                "  Waiting for first successful cycle…"
+            )
+        else:
+            bwin_section = ""  # detection disabled entirely — omit
+
         msg = (
             f"💓 <b>Monitor heartbeat</b>\n"
             f"Uptime: <b>{hours}h {minutes}m</b>  |  {now_str}"
             f"{match_section}"
             f"{report_summary}"
+            f"{bwin_section}"
         )
+
+        # Telegram message cap is 4096 chars; trim defensively if we go over.
+        if len(msg) > 4000:
+            msg = msg[:3985] + "\n[…truncated]"
+
         print(f"[heartbeat] Sending alive message (uptime {hours}h {minutes}m), "
-              f"{len(current_matches)} live match(es), {n_reports} report(s)")
+              f"{len(current_matches)} live match(es), {n_reports} report(s), "
+              f"bwin section: {'yes' if bwin_html else 'no'}")
         await send_telegram(msg)
 
         # ── Flush pending anomaly reports ──────────────────────────────
@@ -912,8 +957,13 @@ async def investigate_and_decide(
 async def main() -> None:
     started_at       = datetime.now(timezone.utc)
     alerted_pairs    = load_alerted_pairs()
-    alerted_delays: set = set()   # tracks delay alerts to avoid re-sending
+    alerted_delays: set = set()   # tracks Flashscore delay alerts to avoid re-sending
+    alerted_bwin_delays: set = set()   # tracks bwin delay alerts to avoid re-sending
+    bwin_delay_pending: dict = {}      # 1st-cycle candidates awaiting 2nd-cycle confirm
     pending_reports: list[dict] = []   # anomaly summaries queued for next heartbeat
+    # Shared snapshot updated after each cycle's bwin check. Read by heartbeat_loop.
+    # Keys: "section_html" (str), "updated_at" (datetime | None).
+    bwin_state: dict = {"section_html": "", "updated_at": None}
     if alerted_pairs:
         print(f"[*] Loaded {len(alerted_pairs)} previously alerted pair(s) from disk.")
 
@@ -930,10 +980,12 @@ async def main() -> None:
     # ── Send startup ping BEFORE browser loads ────────────────────────
     ai_status    = "MiniMax-M2.7 ✓" if ai_enabled else "rule-based only"
     delay_status = "Flashscore.mobi ✓" if DELAY_DETECTION else "disabled"
+    bwin_status  = "bwin ✓ (2-cycle debounce)" if BWIN_DELAY_DETECTION else "disabled"
     await send_telegram(
         f"🟢 <b>Tennis duplicate monitor starting…</b>\n"
         f"AI analysis: <b>{ai_status}</b>\n"
         f"Delay detection: <b>{delay_status}</b>\n"
+        f"bwin reference: <b>{bwin_status}</b>\n"
         f"Polling every {CHECK_INTERVAL}s · Heartbeat every {HEARTBEAT_INTERVAL // 60}min\n"
         f"Started at: {started_at.strftime('%Y-%m-%d %H:%M UTC')}"
     )
@@ -958,15 +1010,53 @@ async def main() -> None:
         )
         page = await context.new_page()
 
+        # ── Persistent bwin reference page ────────────────────────────
+        # bwin uses a WebSocket (wss://cds-push.bwin.com) to keep the DOM
+        # live without reloads. We open ONE tab here and re-read on each
+        # polling cycle. A separate BrowserContext keeps bwin's geo-block
+        # cookies isolated from Dafabet's session.
+        bwin_page = None
+        if BWIN_DELAY_DETECTION:
+            try:
+                bwin_context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1400, "height": 900},
+                    locale="en-US",
+                )
+                bwin_page = await bwin_context.new_page()
+                print(f"[*] Opening persistent bwin reference page: {BWIN_LIVE_URL}")
+                await bwin_page.goto(BWIN_LIVE_URL, wait_until="domcontentloaded", timeout=45_000)
+                await bwin_page.wait_for_timeout(5_000)
+                # Dismiss cookie banner once
+                for label in ("Allow All", "Accept All", "Accept"):
+                    try:
+                        btn = bwin_page.get_by_role("button", name=label)
+                        if await btn.count():
+                            await btn.first.click(timeout=2_000)
+                            print(f"[*] bwin cookie banner dismissed ({label})")
+                            break
+                    except Exception:
+                        pass
+                print("[*] bwin reference page ready.\n")
+            except Exception as exc:
+                print(f"[!] bwin reference page failed to open: {exc}")
+                print("[!] Continuing without bwin reference source.")
+                bwin_page = None
+
         print(f"[*] Starting tennis duplicate detector. Polling every {CHECK_INTERVAL}s.")
         print(f"[*] Similarity threshold: {SIMILARITY_THRESHOLD}  |  Min per-side: {MIN_SIDE_SCORE}")
         print(f"[*] Heartbeat: every {HEARTBEAT_INTERVAL // 60}min")
         print(f"[*] Delay detection: {'ON (flashscore.mobi)' if DELAY_DETECTION else 'OFF'}")
+        print(f"[*] bwin reference:  {'ON' if bwin_page else 'OFF'}")
         print(f"[*] URL: {TENNIS_URL}\n")
 
         # ── Launch heartbeat as a background task ─────────────────────
         heartbeat_task = asyncio.create_task(
-            heartbeat_loop(started_at, current_matches, pending_reports)
+            heartbeat_loop(started_at, current_matches, pending_reports, bwin_state)
         )
 
         try:
@@ -1109,12 +1199,19 @@ async def main() -> None:
                         else:
                             print("[AI] No new issues detected.")
 
-                    # ── Score delay detection (Flashscore.mobi) ───────────
-                    if DELAY_DETECTION and live_entries:
+                    # ── Score delay detection (Flashscore.mobi + bwin) ────
+                    # Dafabet scores are extracted ONCE per cycle and shared
+                    # between both reference sources (Flashscore and bwin).
+                    scored_entries: list[dict] = []
+                    if (DELAY_DETECTION or (BWIN_DELAY_DETECTION and bwin_page)) and live_entries:
                         try:
-                            # Extract detailed scores from each Dafabet match page
                             scored_entries = await extract_dafabet_scores(context, live_entries)
+                        except Exception as exc:
+                            print(f"[delay] extract_dafabet_scores failed: {exc}")
+                            scored_entries = []
 
+                    if DELAY_DETECTION and scored_entries:
+                        try:
                             # Compare against Flashscore.mobi (sets, games, points)
                             delay_alerts = await check_score_delays(
                                 context, scored_entries, alerted_delays
@@ -1137,6 +1234,55 @@ async def main() -> None:
                         except Exception as exc:
                             print(f"[delay] Error during delay check: {exc}")
 
+                    # ── bwin cross-reference delay detection ───────────────
+                    # Uses bwin.com as the reference clock. Reuses the
+                    # already-extracted Dafabet scores. Two-cycle debounce:
+                    # a lag must persist across two consecutive cycles before
+                    # an alert is fired (false-alarm suppression).
+                    #
+                    # Also refreshes `bwin_state["section_html"]` so the
+                    # hourly heartbeat can embed an up-to-date snapshot of
+                    # the Dafabet↔bwin cross-reference (coverage, pending
+                    # candidates, confirmed active delays).
+                    if BWIN_DELAY_DETECTION and bwin_page and scored_entries:
+                        try:
+                            # Fetch once, reuse for both the delay check
+                            # and the heartbeat snapshot builder.
+                            bwin_matches_now = await fetch_bwin_live(bwin_page)
+
+                            bwin_alerts = await check_bwin_delays(
+                                bwin_matches_now,
+                                scored_entries,
+                                alerted_bwin_delays,
+                                bwin_delay_pending,
+                            )
+
+                            for ba in bwin_alerts:
+                                await send_telegram(ba["alert_msg"])
+                                print(f"[bwin] Alert sent for: "
+                                      f"{ba['dafabet_entry']['home']} vs "
+                                      f"{ba['dafabet_entry']['away']}")
+
+                            # Expire bwin delay alerts for matches no longer live
+                            expired_bwin = {
+                                k for k in alerted_bwin_delays
+                                if k[0] not in current_urls
+                            }
+                            if expired_bwin:
+                                alerted_bwin_delays -= expired_bwin
+
+                            # Refresh the shared snapshot for the heartbeat.
+                            bwin_state["section_html"] = build_bwin_heartbeat_section(
+                                bwin_matches_now,
+                                scored_entries,
+                                alerted_bwin_delays,
+                                bwin_delay_pending,
+                            )
+                            bwin_state["updated_at"] = datetime.now(timezone.utc)
+
+                        except Exception as exc:
+                            print(f"[bwin] Error during bwin delay check: {exc}")
+
                 print(f"\n--- sleeping {CHECK_INTERVAL}s ---\n")
                 await asyncio.sleep(CHECK_INTERVAL)
 
@@ -1148,6 +1294,11 @@ async def main() -> None:
                 f"🔴 <b>Tennis duplicate monitor stopped</b>\n"
                 f"Stopped at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
             )
+            if bwin_page is not None:
+                try:
+                    await bwin_page.close()
+                except Exception:
+                    pass
             await browser.close()
             print("[*] Browser closed.")
 
