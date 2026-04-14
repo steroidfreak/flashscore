@@ -1394,13 +1394,21 @@ async def check_bwin_delays(
 
         # ── Sanity check: Dafabet score extraction is known-brittle and
         # sometimes parses odds/IDs as set/game numbers (e.g. sets=80-4,
-        # games=(40,40)). Reject impossible tennis states so we don't fire
-        # phantom delay alerts. Real tennis: best of 5 → max 3 sets per side,
-        # games per set max ~13 (tiebreak or 12-12 in some formats).
+        # games=(40,40)) or fails entirely and returns an empty game list.
+        # Reject impossible tennis states so we don't fire phantom delay
+        # alerts. Real tennis: best of 5 → max 3 sets per side, games per
+        # set max ~13 (tiebreak or 12-12 in some formats).
         if dafa_sets[0] > 5 or dafa_sets[1] > 5 or dafa_current > 5:
             print(f"[bwin] Skipping {dafa['home']} vs {dafa['away']} — "
                   f"Dafabet score implausible (sets={dafa_sets}, "
                   f"set={dafa_current}); likely parse error upstream.")
+            continue
+        # No game data at all → Dafabet extractor failed for this match
+        # (reported as "Games: [N/A]" in alerts). Treating empty as (0,0)
+        # makes any live bwin state look like a lag → false positives.
+        if not dafa_games:
+            print(f"[bwin] Skipping {dafa['home']} vs {dafa['away']} — "
+                  f"Dafabet game scores unavailable (N/A); cannot compare.")
             continue
         implausible_games = any(
             (not isinstance(g, (tuple, list)))
@@ -1613,6 +1621,12 @@ def build_bwin_heartbeat_section(
         # Same sanity filter as check_bwin_delays — skip entries whose
         # Dafabet state is garbage so we don't report phantom delays.
         if (dafa_sets[0] > 5 or dafa_sets[1] > 5 or dafa_current > 5):
+            skipped_invalid += 1
+            continue
+        # Dafabet extractor failed to parse game data (renders as "N/A"
+        # in alerts). Without games we can't compare — empty list would
+        # be treated as (0,0) and produce phantom delays.
+        if not dafa_games:
             skipped_invalid += 1
             continue
         bad_games = any(
