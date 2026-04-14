@@ -41,7 +41,7 @@ Optional .env keys:
   MIN_SIDE_SCORE       – rule-based per-side floor (default: 0.60)
   HEADLESS             – run browser headless (default: true)
   AI_ANALYSIS          – enable LLM analysis layer (default: true)
-  DEEPSEEK_API_KEY      – required when AI_ANALYSIS=true (DeepSeek)
+  MINIMAX_API_KEY      – required when AI_ANALYSIS=true (MiniMax-M2.7)
 """
 
 import asyncio
@@ -101,8 +101,8 @@ HEADLESS: bool = os.getenv("HEADLESS", "true").lower() in ("1", "true", "yes")
 # Enable AI analysis layer (default: true)
 AI_ANALYSIS: bool = os.getenv("AI_ANALYSIS", "true").lower() in ("1", "true", "yes")
 
-# DeepSeek API key – required when AI_ANALYSIS=true
-DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+# MiniMax API key – required when AI_ANALYSIS=true
+MINIMAX_API_KEY: str = os.getenv("MINIMAX_API_KEY", "")
 
 # Enable score delay detection via Flashscore.mobi (default: true)
 DELAY_DETECTION: bool = os.getenv("DELAY_DETECTION", "true").lower() in ("1", "true", "yes")
@@ -436,20 +436,20 @@ def _parse_ai_response(text: str, entries: list[dict]) -> list[dict]:
     return issues
 
 
-async def _call_deepseek(prompt: str) -> str:
-    """Call DeepSeek via its OpenAI-compatible API and return the text response."""
+async def _call_minimax(prompt: str) -> str:
+    """Call MiniMax-M2.7 via its OpenAI-compatible API and return the text response."""
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Authorization": f"Bearer {MINIMAX_API_KEY}",
         "Content-Type":  "application/json",
     }
     payload = {
-        "model":      "deepseek-chat",
+        "model":      "MiniMax-M2.7",
         "messages":   [{"role": "user", "content": prompt}],
         "max_tokens": 1024,
     }
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
-            "https://api.deepseek.com/chat/completions",
+            "https://api.minimax.io/v1/chat/completions",
             headers=headers,
             json=payload,
         )
@@ -459,7 +459,7 @@ async def _call_deepseek(prompt: str) -> str:
 
 async def ai_analyze_matches(entries: list[dict]) -> list[dict]:
     """
-    Send live match entries to DeepSeek for anomaly detection.
+    Send live match entries to MiniMax-M2.7 for anomaly detection.
 
     Detects:
       DUPLICATE       – same real match listed twice (incl. sides swapped / name formats)
@@ -473,9 +473,9 @@ async def ai_analyze_matches(entries: list[dict]) -> list[dict]:
     prompt = _build_ai_prompt(entries)
 
     try:
-        text = await _call_deepseek(prompt)
+        text = await _call_minimax(prompt)
     except Exception as exc:
-        print(f"[AI] DeepSeek call error: {exc}")
+        print(f"[AI] MiniMax call error: {exc}")
         return []
 
     return _parse_ai_response(text, entries)
@@ -921,14 +921,14 @@ async def main() -> None:
     ai_enabled: bool = False
 
     if AI_ANALYSIS:
-        if DEEPSEEK_API_KEY:
+        if MINIMAX_API_KEY:
             ai_enabled = True
-            print("[*] AI analysis enabled – DeepSeek.")
+            print("[*] AI analysis enabled – MiniMax-M2.7.")
         else:
-            print("[!] AI_ANALYSIS=true but DEEPSEEK_API_KEY not set – AI disabled.")
+            print("[!] AI_ANALYSIS=true but MINIMAX_API_KEY not set – AI disabled.")
 
     # ── Send startup ping BEFORE browser loads ────────────────────────
-    ai_status    = "DeepSeek ✓" if ai_enabled else "rule-based only"
+    ai_status    = "MiniMax-M2.7 ✓" if ai_enabled else "rule-based only"
     delay_status = "Flashscore.mobi ✓" if DELAY_DETECTION else "disabled"
     await send_telegram(
         f"🟢 <b>Tennis duplicate monitor starting…</b>\n"
@@ -1044,7 +1044,7 @@ async def main() -> None:
 
                     # ── AI analysis ───────────────────────────────────────────
                     if ai_enabled:
-                        print(f"\n[AI] Running batch analysis (DeepSeek)…")
+                        print(f"\n[AI] Running batch analysis (MiniMax-M2.7)…")
                         ai_issues = await ai_analyze_matches(live_entries)
 
                         new_ai = []
@@ -1088,10 +1088,10 @@ async def main() -> None:
 
                                 if kind == "PLAYER_CONFLICT":
                                     emoji      = "⚠️"
-                                    type_label = "Player conflict detected! (DeepSeek)"
+                                    type_label = "Player conflict detected! (MiniMax-M2.7)"
                                 else:  # DUPLICATE
                                     emoji      = "🎾"
-                                    type_label = "Possible duplicate tennis match! (DeepSeek)"
+                                    type_label = "Possible duplicate tennis match! (MiniMax-M2.7)"
 
                                 report_note = f"\n\nReport saved: {report_path}" if report_path else ""
                                 msg = (
