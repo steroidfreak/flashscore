@@ -109,7 +109,7 @@ def _build_telegram_recipients() -> list[tuple[str, str]]:
 TELEGRAM_RECIPIENTS: list[tuple[str, str]] = _build_telegram_recipients()
 
 # Seconds between each poll of the tennis listing page (default 1 minute)
-CHECK_INTERVAL: int       = int(os.getenv("CHECK_INTERVAL", "120"))
+CHECK_INTERVAL: int       = int(os.getenv("CHECK_INTERVAL", "60"))
 
 # Heartbeat is sent daily at 07:00 UTC (no longer configurable via env)
 
@@ -154,12 +154,12 @@ VOLLEYBALL_URL: str = "https://sports.dafabet.com/en/live/sport/1200-VOLL"
 BASK_ENABLED: bool = os.getenv("BASK_ENABLED", "true").lower() in ("1", "true", "yes")
 VOLL_ENABLED: bool = os.getenv("VOLL_ENABLED", "true").lower() in ("1", "true", "yes")
 
-BASK_CHECK_INTERVAL: int   = int(os.getenv("BASK_CHECK_INTERVAL", "120"))
+BASK_CHECK_INTERVAL: int   = int(os.getenv("BASK_CHECK_INTERVAL", "60"))
 BASK_SIMILARITY_THRESHOLD: float = float(os.getenv("BASK_SIMILARITY_THRESHOLD", "0.70"))
 BASK_MIN_SIDE_SCORE:       float = float(os.getenv("BASK_MIN_SIDE_SCORE",       "0.35"))
 BASK_STRONG_SIDE_SCORE:    float = float(os.getenv("BASK_STRONG_SIDE_SCORE",    "0.90"))
 
-VOLL_CHECK_INTERVAL: int   = int(os.getenv("VOLL_CHECK_INTERVAL", "120"))
+VOLL_CHECK_INTERVAL: int   = int(os.getenv("VOLL_CHECK_INTERVAL", "60"))
 VOLL_SIMILARITY_THRESHOLD: float = float(os.getenv("VOLL_SIMILARITY_THRESHOLD", "0.70"))
 VOLL_MIN_SIDE_SCORE:       float = float(os.getenv("VOLL_MIN_SIDE_SCORE",       "0.35"))
 VOLL_STRONG_SIDE_SCORE:    float = float(os.getenv("VOLL_STRONG_SIDE_SCORE",    "0.90"))
