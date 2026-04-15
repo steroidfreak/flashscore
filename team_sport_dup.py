@@ -411,11 +411,24 @@ async def run_team_sport_loop(
                 alerted_pairs -= expired
                 save_pairs(pairs_file, alerted_pairs)
 
-            live_entries = [e for e in entries if not e.get("not_started")]
+            live_entries        = [e for e in entries if not e.get("not_started")]
+            not_started_entries = [e for e in entries if e.get("not_started")]
+
+            # Per-cycle inventory dump (mirrors the tennis loop's format
+            # in monitor.py so all three sports look the same on stdout).
             print(
-                f"[{sport}] {len(live_entries)} live match(es) "
-                f"({len(entries) - len(live_entries)} not started)."
+                f"\n[{sport}] {len(entries)} match(es) on listing page "
+                f"({len(live_entries)} live, {len(not_started_entries)} not started):"
             )
+            for e in live_entries:
+                section = e.get("section") or "—"
+                print(f"    [LIVE]        {e['home']} vs {e['away']}  ({section})")
+            for e in not_started_entries:
+                section = e.get("section") or "—"
+                print(
+                    f"    [NOT STARTED] {e['home']} vs {e['away']}  ({section})"
+                    f"  ← excluded from checks"
+                )
 
             if counters is not None:
                 state = counters[sport]
