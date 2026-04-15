@@ -1,8 +1,23 @@
 """
-Dafabet Tennis Duplicate Match Detector
-========================================
-Monitors https://sports.dafabet.com/en/live/sport/239-TENN every
-CHECK_INTERVAL seconds.
+Dafabet Multi-Sport Duplicate Match Detector
+============================================
+Monitors three Dafabet live listings in parallel from a single process:
+  • Tennis      – https://sports.dafabet.com/en/live/sport/239-TENN
+  • Basketball  – https://sports.dafabet.com/en/live/sport/227-BASK
+  • Volleyball  – https://sports.dafabet.com/en/live/sport/1200-VOLL
+
+Tennis keeps its rich pipeline (player-name model, MiniMax AI layer,
+Flashscore + bwin delay detection, anomaly investigation, heartbeat).
+Basketball and volleyball use the shared team-name model in
+team_sport_dup.py – same DOM scraping, but a Jaccard + fuzzy + shared
+"distinctive token" matcher tuned for team names instead of players.
+
+Self-test
+---------
+  python monitor.py --test                # built-in cases
+  python monitor.py --test cases.json     # user-supplied JSON
+  python monitor.py --test cases.txt      # plain-text format
+See selftest.py for the file formats.
 
 Detects when two live match listings are likely the SAME real match
 listed twice with slightly different player name formats, e.g.:
@@ -65,6 +80,7 @@ from delay_detector import (
     build_bwin_heartbeat_section,
     fetch_bwin_live,
 )
+from team_sport_dup import run_team_sport_loop
 
 # ── Load secrets from .env (never commit .env to git) ─────────────
 load_dotenv()
@@ -77,7 +93,13 @@ load_dotenv()
 # Primary: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
 # Optional second: TELEGRAM_BOT_TOKEN_2 + TELEGRAM_CHAT_ID_2
 def _build_telegram_recipients() -> list[tuple[str, str]]:
-    pairs = [(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"])]
+    # Defensive: returns [] when env vars are missing so other modules
+    # (selftest.py) can `import monitor` without a real .env.
+    tok = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    cid = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not (tok and cid):
+        return []
+    pairs = [(tok, cid)]
     tok2 = os.getenv("TELEGRAM_BOT_TOKEN_2", "").strip()
     cid2 = os.getenv("TELEGRAM_CHAT_ID_2", "").strip()
     if tok2 and cid2:
@@ -123,8 +145,29 @@ HEARTBEAT_INTERVAL: int = int(os.getenv("HEARTBEAT_INTERVAL", "3600"))
 # Tennis live page URL
 TENNIS_URL: str = "https://sports.dafabet.com/en/live/sport/239-TENN"
 
+# ── Basketball / Volleyball (team-sport) config ───────────────────
+# These two share the same scraping + similarity logic from team_sport_dup.py.
+# They run as their own asyncio tasks alongside the tennis loop.
+BASKETBALL_URL: str = "https://sports.dafabet.com/en/live/sport/227-BASK"
+VOLLEYBALL_URL: str = "https://sports.dafabet.com/en/live/sport/1200-VOLL"
+
+BASK_ENABLED: bool = os.getenv("BASK_ENABLED", "true").lower() in ("1", "true", "yes")
+VOLL_ENABLED: bool = os.getenv("VOLL_ENABLED", "true").lower() in ("1", "true", "yes")
+
+BASK_CHECK_INTERVAL: int   = int(os.getenv("BASK_CHECK_INTERVAL", "120"))
+BASK_SIMILARITY_THRESHOLD: float = float(os.getenv("BASK_SIMILARITY_THRESHOLD", "0.70"))
+BASK_MIN_SIDE_SCORE:       float = float(os.getenv("BASK_MIN_SIDE_SCORE",       "0.35"))
+BASK_STRONG_SIDE_SCORE:    float = float(os.getenv("BASK_STRONG_SIDE_SCORE",    "0.90"))
+
+VOLL_CHECK_INTERVAL: int   = int(os.getenv("VOLL_CHECK_INTERVAL", "120"))
+VOLL_SIMILARITY_THRESHOLD: float = float(os.getenv("VOLL_SIMILARITY_THRESHOLD", "0.70"))
+VOLL_MIN_SIDE_SCORE:       float = float(os.getenv("VOLL_MIN_SIDE_SCORE",       "0.35"))
+VOLL_STRONG_SIDE_SCORE:    float = float(os.getenv("VOLL_STRONG_SIDE_SCORE",    "0.90"))
+
 # File used to persist alerted pairs across restarts
-PAIRS_FILE: Path = Path(".alerted_pairs.json")
+PAIRS_FILE:      Path = Path(".alerted_pairs.json")
+BASK_PAIRS_FILE: Path = Path(".alerted_pairs_basketball.json")
+VOLL_PAIRS_FILE: Path = Path(".alerted_pairs_volleyball.json")
 
 # Directory for anomaly investigation reports
 ANOMALY_DIR: Path = Path("anomaly_reports")
@@ -639,10 +682,11 @@ async def send_telegram(text: str) -> None:
 
 
 async def heartbeat_loop(
-    started_at:      datetime,
-    current_matches: list[dict],
-    pending_reports: list[dict],
-    bwin_state:      dict,
+    started_at:          datetime,
+    current_matches:     list[dict],
+    pending_reports:     list[dict],
+    bwin_state:          dict,
+    team_sport_counters: dict | None = None,
 ) -> None:
     """
     Send a Telegram 'still alive' message every HEARTBEAT_INTERVAL seconds
@@ -671,9 +715,24 @@ async def heartbeat_loop(
                 f"  {i + 1}. {e['home']} vs {e['away']}"
                 for i, e in enumerate(current_matches)
             )
-            match_section = f"\n\n🎾 <b>Live matches ({len(current_matches)}):</b>\n{match_lines}"
+            match_section = f"\n\n🎾 <b>Tennis live ({len(current_matches)}):</b>\n{match_lines}"
         else:
-            match_section = "\n\n🎾 No live matches right now."
+            match_section = "\n\n🎾 No live tennis right now."
+
+        # Team-sport coverage block (basketball + volleyball)
+        team_sport_section = ""
+        if team_sport_counters:
+            sport_emojis = {"basketball": "🏀", "volleyball": "🏐"}
+            for sport_name, state in team_sport_counters.items():
+                emo = sport_emojis.get(sport_name, "•")
+                live = state.get("live_count", 0)
+                alerts = state.get("alerts_since_heartbeat", 0)
+                team_sport_section += (
+                    f"\n\n{emo} <b>{sport_name.title()} live ({live}):</b>"
+                    f"  alerts since last heartbeat: {alerts}"
+                )
+                # Reset the per-heartbeat counter
+                state["alerts_since_heartbeat"] = 0
 
         # Count reports accumulated since last heartbeat for the summary line
         n_reports = len(pending_reports)
@@ -702,9 +761,10 @@ async def heartbeat_loop(
             bwin_section = ""  # detection disabled entirely — omit
 
         msg = (
-            f"💓 <b>Monitor heartbeat</b>\n"
+            f"💓 <b>Multi-sport monitor heartbeat</b>\n"
             f"Uptime: <b>{hours}h {minutes}m</b>  |  {now_str}"
             f"{match_section}"
+            f"{team_sport_section}"
             f"{report_summary}"
             f"{bwin_section}"
         )
@@ -981,12 +1041,20 @@ async def main() -> None:
     ai_status    = "MiniMax-M2.7 ✓" if ai_enabled else "rule-based only"
     delay_status = "Flashscore.mobi ✓" if DELAY_DETECTION else "disabled"
     bwin_status  = "bwin ✓ (2-cycle debounce)" if BWIN_DELAY_DETECTION else "disabled"
+    sports_enabled = ["🎾 tennis"]
+    if BASK_ENABLED:
+        sports_enabled.append("🏀 basketball")
+    if VOLL_ENABLED:
+        sports_enabled.append("🏐 volleyball")
     await send_telegram(
-        f"🟢 <b>Tennis duplicate monitor starting…</b>\n"
-        f"AI analysis: <b>{ai_status}</b>\n"
+        f"🟢 <b>Multi-sport duplicate monitor starting…</b>\n"
+        f"Sports: <b>{' + '.join(sports_enabled)}</b>\n"
+        f"AI analysis (tennis): <b>{ai_status}</b>\n"
         f"Delay detection: <b>{delay_status}</b>\n"
         f"bwin reference: <b>{bwin_status}</b>\n"
-        f"Polling every {CHECK_INTERVAL}s · Heartbeat every {HEARTBEAT_INTERVAL // 60}min\n"
+        f"Polling: tennis {CHECK_INTERVAL}s · "
+        f"basketball {BASK_CHECK_INTERVAL}s · volleyball {VOLL_CHECK_INTERVAL}s\n"
+        f"Heartbeat every {HEARTBEAT_INTERVAL // 60}min\n"
         f"Started at: {started_at.strftime('%Y-%m-%d %H:%M UTC')}"
     )
 
@@ -1047,17 +1115,61 @@ async def main() -> None:
                 print("[!] Continuing without bwin reference source.")
                 bwin_page = None
 
-        print(f"[*] Starting tennis duplicate detector. Polling every {CHECK_INTERVAL}s.")
-        print(f"[*] Similarity threshold: {SIMILARITY_THRESHOLD}  |  Min per-side: {MIN_SIDE_SCORE}")
+        print(f"[*] Starting multi-sport duplicate detector. Polling every {CHECK_INTERVAL}s (tennis).")
+        print(f"[*] Tennis    threshold: {SIMILARITY_THRESHOLD}  |  Min per-side: {MIN_SIDE_SCORE}")
         print(f"[*] Heartbeat: every {HEARTBEAT_INTERVAL // 60}min")
         print(f"[*] Delay detection: {'ON (flashscore.mobi)' if DELAY_DETECTION else 'OFF'}")
         print(f"[*] bwin reference:  {'ON' if bwin_page else 'OFF'}")
-        print(f"[*] URL: {TENNIS_URL}\n")
+        print(f"[*] Tennis URL:     {TENNIS_URL}")
+        print(f"[*] Basketball:     {'ON' if BASK_ENABLED else 'OFF'}  ({BASKETBALL_URL})")
+        print(f"[*] Volleyball:     {'ON' if VOLL_ENABLED else 'OFF'}  ({VOLLEYBALL_URL})\n")
 
         # ── Launch heartbeat as a background task ─────────────────────
+        # `team_sport_counters` is a shared dict that the parallel
+        # basketball/volleyball loops update each cycle so the heartbeat
+        # can report their live coverage too.
+        team_sport_counters: dict = {}
         heartbeat_task = asyncio.create_task(
-            heartbeat_loop(started_at, current_matches, pending_reports, bwin_state)
+            heartbeat_loop(
+                started_at, current_matches, pending_reports, bwin_state,
+                team_sport_counters,
+            )
         )
+
+        # ── Launch basketball + volleyball loops as parallel tasks ───
+        team_sport_tasks: list[asyncio.Task] = []
+        bask_page = None
+        voll_page = None
+        if BASK_ENABLED:
+            bask_page = await context.new_page()
+            team_sport_tasks.append(asyncio.create_task(run_team_sport_loop(
+                sport="basketball",
+                emoji="🏀",
+                url=BASKETBALL_URL,
+                page=bask_page,
+                interval=BASK_CHECK_INTERVAL,
+                threshold=BASK_SIMILARITY_THRESHOLD,
+                min_side=BASK_MIN_SIDE_SCORE,
+                strong_side=BASK_STRONG_SIDE_SCORE,
+                pairs_file=BASK_PAIRS_FILE,
+                send_telegram=send_telegram,
+                counters=team_sport_counters,
+            )))
+        if VOLL_ENABLED:
+            voll_page = await context.new_page()
+            team_sport_tasks.append(asyncio.create_task(run_team_sport_loop(
+                sport="volleyball",
+                emoji="🏐",
+                url=VOLLEYBALL_URL,
+                page=voll_page,
+                interval=VOLL_CHECK_INTERVAL,
+                threshold=VOLL_SIMILARITY_THRESHOLD,
+                min_side=VOLL_MIN_SIDE_SCORE,
+                strong_side=VOLL_STRONG_SIDE_SCORE,
+                pairs_file=VOLL_PAIRS_FILE,
+                send_telegram=send_telegram,
+                counters=team_sport_counters,
+            )))
 
         try:
             while True:
@@ -1290,18 +1402,32 @@ async def main() -> None:
             print("\n[*] Stopped by user.")
         finally:
             heartbeat_task.cancel()
+            for t in team_sport_tasks:
+                t.cancel()
             await send_telegram(
-                f"🔴 <b>Tennis duplicate monitor stopped</b>\n"
+                f"🔴 <b>Multi-sport duplicate monitor stopped</b>\n"
                 f"Stopped at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
             )
-            if bwin_page is not None:
-                try:
-                    await bwin_page.close()
-                except Exception:
-                    pass
+            for p in (bwin_page, bask_page, voll_page):
+                if p is not None:
+                    try:
+                        await p.close()
+                    except Exception:
+                        pass
             await browser.close()
             print("[*] Browser closed.")
 
 
 if __name__ == "__main__":
+    import sys
+
+    # `python monitor.py --test [path]` runs the offline self-test
+    # against built-in cases and (optionally) a user-supplied JSON or
+    # plain-text test file. See selftest.py for the file formats.
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        from selftest import run_selftest
+        path = sys.argv[2] if len(sys.argv) > 2 else None
+        ok = run_selftest(path)
+        sys.exit(0 if ok else 1)
+
     asyncio.run(main())

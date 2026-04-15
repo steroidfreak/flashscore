@@ -1,0 +1,32 @@
+# Example self-test cases for the duplicate detector.
+#
+# Format: sport  verdict  homeA / awayA | homeB / awayB
+#   sport:   tennis | basketball | volleyball
+#   verdict: DUP / DUPLICATE / Y   -> expected duplicate
+#            NOT / DISTINCT / N    -> expected NOT a duplicate
+# Comment lines start with '#'.
+#
+# To test a pair you saw in a screenshot, transcribe the four
+# team / player names into a line below and run:
+#   python selftest.py selftest_cases.example.txt
+# (or:  python monitor.py --test selftest_cases.example.txt)
+#
+# OCR is intentionally NOT built in to keep deps light. Type it out.
+
+# ── Basketball: the screenshot pair (IMG_0202 / IMG_0203) ─────────
+basketball  DUP  Colegio Los Leones / CD Espanol De Talca | Leones de Quilpue / CD Espanol De Talca
+
+# Same pair with sides swapped on one listing
+basketball  DUP  CD Espanol De Talca / Colegio Los Leones | Leones de Quilpue / CD Espanol De Talca
+
+# Should NOT trigger – completely different game
+basketball  NOT  Lakers / Celtics | Warriors / Bulls
+
+# ── Volleyball: VC / VK prefix variants ───────────────────────────
+volleyball  DUP  VK Dukla Liberec / VC Praha | Dukla Liberec / Praha
+volleyball  NOT  Zenit Kazan / Belogorie Belgorod | Lokomotiv / Dynamo Moscow
+
+# ── Tennis: name-format drift (from MEMORY.md) ────────────────────
+tennis      DUP  Butvilas, Edas / Imamura, Masamichi | Butvilas, E / Imamura, M
+tennis      DUP  Shimizu Y / Romios M C | Shimizu, Yuki / Romios, Marc
+tennis      NOT  Butvilas, Edas / Kopp, S | Imamura, M / Popovic, S

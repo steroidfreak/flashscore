@@ -1,0 +1,23 @@
+{
+  "cases": [
+    {
+      "sport": "basketball",
+      "match_a": {"home": "Colegio Los Leones", "away": "CD Espanol De Talca"},
+      "match_b": {"home": "Leones de Quilpue",  "away": "CD Espanol De Talca"},
+      "expected": "duplicate",
+      "label": "screenshot pair (JSON variant)"
+    },
+    {
+      "sport": "volleyball",
+      "match_a": {"home": "VK Dukla Liberec", "away": "VC Praha"},
+      "match_b": {"home": "Dukla Liberec",    "away": "Praha"},
+      "expected": "duplicate"
+    },
+    {
+      "sport": "tennis",
+      "match_a": {"home": "Butvilas, Edas", "away": "Imamura, Masamichi"},
+      "match_b": {"home": "Butvilas, E",    "away": "Imamura, M"},
+      "expected": "duplicate"
+    }
+  ]
+}

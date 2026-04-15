@@ -40,3 +40,7 @@ tennis_analysis.json
 tennis_page.png
 *_analysis.txt
 *_analysis.json
+
+# ── Runtime state (per-sport persisted alerted pairs) ──────────────
+.alerted_pairs*.json
+anomaly_reports/
