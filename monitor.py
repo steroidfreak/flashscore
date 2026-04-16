@@ -727,10 +727,19 @@ async def heartbeat_loop(
                 emo = sport_emojis.get(sport_name, "•")
                 live = state.get("live_count", 0)
                 alerts = state.get("alerts_since_heartbeat", 0)
-                team_sport_section += (
+                matches = state.get("current_matches") or []
+                header = (
                     f"\n\n{emo} <b>{sport_name.title()} live ({live}):</b>"
                     f"  alerts since last heartbeat: {alerts}"
                 )
+                if matches:
+                    lines = "\n".join(
+                        f"  {i + 1}. {e['home']} vs {e['away']}"
+                        for i, e in enumerate(matches)
+                    )
+                    team_sport_section += f"{header}\n{lines}"
+                else:
+                    team_sport_section += f"{header}\n  (no live matches)"
                 # Reset the per-heartbeat counter
                 state["alerts_since_heartbeat"] = 0
 
