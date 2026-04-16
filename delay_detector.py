@@ -102,8 +102,14 @@ def parse_flashscore_line(line: str) -> dict | None:
     # Remove image tags that appear in the raw text
     line = re.sub(r"!\[.*?\]\(.*?\)", "", line).strip()
 
-    # Extract sets won: [X:Y]
-    sets_match = re.search(r"\[(\d+):(\d+)\]", line)
+    # Extract sets won: either "[X:Y]" (old format) or bare "X:Y" right
+    # before the games list "(g:g,g:g,...)" (current flashscore.mobi format,
+    # observed 2026-04-16).  Examples both accepted:
+    #   "Sinner J. (Ita) [0:1] (1:6,4:4)"   ← old
+    #   "Riedi L. (Sui) 0:1 (6:7,2:3)"      ← new
+    # Use a lookahead to anchor against the games parenthesis and ensure
+    # we don't accidentally match digits inside a country code paren.
+    sets_match = re.search(r"\[?(\d+):(\d+)\]?(?=\s*\([0-9])", line)
     if not sets_match:
         return None
 
@@ -634,91 +640,104 @@ async def extract_dafabet_scores(browser_context, entries: list[dict]) -> list[d
             await page.goto(entry["url"], wait_until="domcontentloaded", timeout=20_000)
             await page.wait_for_timeout(2_500)
 
-            score_info = await page.evaluate("""
+            score_info = await page.evaluate(r"""
                 () => {
-                    const text = (document.body.innerText || '').trim();
-                    const lines = text.split('\\n').map(l => l.trim()).filter(Boolean);
+                    // ── Primary source: the scoreboard <table> ───────────────
+                    // Dafabet match pages render the actual scoreboard as
+                    //   <table class="label-small text-center">
+                    //     <tr><td>Sets</td><td>1</td><td>2</td><td>3</td></tr>
+                    //     <tr><td>1</td><td>6</td><td>4</td><td>2</td></tr>  ← home
+                    //     <tr><td>1</td><td>3</td><td>6</td><td>2</td></tr>  ← away
+                    // The first cell in each player row is the sets-won count;
+                    // every following cell is games in that set. The set
+                    // numbers in the header row tell us which set is current
+                    // (the LAST column). Confirmed DOM 2026-04-16.
+                    const table = document.querySelector('table.label-small.text-center');
 
-                    // Collect all short numeric-looking text elements
-                    // Dafabet scoreboard typically has rows like:
-                    //   Player1   6  3
-                    //   Player2   4  5
-                    // Or score cells showing set-by-set scores
-
-                    let allNums = [];
-                    const divs = document.querySelectorAll('div, span, td');
-                    for (const el of divs) {
-                        const t = (el.innerText || '').trim();
-                        // Look for single/double digit scores
-                        if (/^\\d{1,2}$/.test(t)) {
-                            const rect = el.getBoundingClientRect();
-                            if (rect.width > 0 && rect.height > 0) {
-                                allNums.push({
-                                    val: parseInt(t),
-                                    x: Math.round(rect.x),
-                                    y: Math.round(rect.y),
-                                    w: Math.round(rect.width),
-                                    h: Math.round(rect.height),
-                                });
-                            }
-                        }
-                    }
-
-                    // Find set score patterns in the full text
-                    // Look for patterns like "6 4 3" (player1 set scores) and "4 6 5" (player2)
-                    // Also look for "Set 1", "Set 2" indicators
-                    const setPattern = /(?:set|s)\\s*(\\d)/gi;
-                    let currentSet = 0;
-                    let m;
-                    while ((m = setPattern.exec(text)) !== null) {
-                        const n = parseInt(m[1]);
-                        if (n > currentSet) currentSet = n;
-                    }
-
-                    // Try to find score rows — lines that are just numbers separated by spaces/tabs
-                    const scoreRows = [];
-                    for (const line of lines) {
-                        // Match lines like "6  4  3" or "6 - 4" patterns
-                        const nums = line.match(/\\b\\d{1,2}\\b/g);
-                        if (nums && nums.length >= 1 && nums.length <= 6) {
-                            const allSmall = nums.every(n => parseInt(n) <= 50);
-                            // Check if line is mostly numbers (score row)
-                            const nonNum = line.replace(/[\\d\\s\\-–|:]/g, '').length;
-                            if (allSmall && nonNum < line.length * 0.5) {
-                                scoreRows.push(nums.map(Number));
-                            }
-                        }
-                    }
-
-                    // Also search for explicit "X - Y" set score format
-                    const setsWon = text.match(/(\\d+)\\s*[-–]\\s*(\\d+)/);
                     let setsHome = 0, setsAway = 0;
-                    if (setsWon) {
-                        setsHome = parseInt(setsWon[1]);
-                        setsAway = parseInt(setsWon[2]);
-                    }
+                    let currentSet = 0;
+                    const gameScores = [];   // [[h, a], [h, a], ...] per set
+                    let tableFound = false;
 
-                    // Fallback current set from sets won
-                    if (currentSet === 0) {
-                        currentSet = setsHome + setsAway + 1;
-                    }
+                    if (table) {
+                        const rows = [...table.querySelectorAll('tr')].map(tr =>
+                            [...tr.children].map(c => (c.innerText || '').trim())
+                        );
+                        // Need header + 2 player rows
+                        if (rows.length >= 3) {
+                            const header = rows[0];
+                            const home = rows[1];
+                            const away = rows[2];
 
-                    // Extract point score within current game (e.g. "30", "15", "40", "AD")
-                    // Dafabet shows point scores like "30 - 15" or "40 - AD" on the match page
-                    let pointHome = null, pointAway = null;
-                    const pointPatterns = [
-                        /\\b(0|15|30|40|AD|A)\\s*[-–:]\\s*(0|15|30|40|AD|A)\\b/gi,
-                    ];
-                    for (const pat of pointPatterns) {
-                        const pm = text.match(pat);
-                        if (pm) {
-                            // Use the last match (usually the current live point score)
-                            const last = pm[pm.length - 1];
-                            const parts = last.split(/[-–:]/);
-                            if (parts.length === 2) {
-                                pointHome = parts[0].trim().toUpperCase();
-                                pointAway = parts[1].trim().toUpperCase();
+                            // Header cells after the "Sets" label are the set
+                            // numbers (1..N). currentSet = max of those.
+                            for (let i = 1; i < header.length; i++) {
+                                const n = parseInt(header[i]);
+                                if (Number.isFinite(n) && n > currentSet) currentSet = n;
                             }
+
+                            const homeNums = home.map(v => parseInt(v));
+                            const awayNums = away.map(v => parseInt(v));
+                            // First cell = sets-won. Treat NaN as 0.
+                            setsHome = Number.isFinite(homeNums[0]) ? homeNums[0] : 0;
+                            setsAway = Number.isFinite(awayNums[0]) ? awayNums[0] : 0;
+
+                            // Remaining cells = games per set. Clamp at tennis-
+                            // realistic 0..20 (tiebreak can push >7 for a brief
+                            // moment). Anything bigger means the cell text is
+                            // not actually a game count.
+                            const nSets = Math.min(homeNums.length, awayNums.length) - 1;
+                            for (let i = 0; i < nSets; i++) {
+                                const h = homeNums[i + 1];
+                                const a = awayNums[i + 1];
+                                if (Number.isFinite(h) && Number.isFinite(a) &&
+                                    h >= 0 && h <= 20 && a >= 0 && a <= 20) {
+                                    gameScores.push([h, a]);
+                                }
+                            }
+                            tableFound = true;
+                        }
+                    }
+
+                    if (!currentSet) currentSet = 1;
+
+                    // ── Point score (within the current game) ────────────────
+                    // Dafabet shows each player's point total as its own token
+                    // right next to their name:
+                    //     Shimabukuro, Sho
+                    //     40
+                    //     Zhukayev, Beibit
+                    //     40
+                    // Just before the scoreboard table. We walk body.innerText
+                    // in order, find the two consecutive single-point tokens
+                    // that precede the "Sets\t..." row.
+                    const text = (document.body.innerText || '');
+                    const lines = text.split('\n').map(l => l.trim());
+
+                    // Locate the "Sets\t1\t2..." line (tabs inside the table
+                    // collapse into a single string when read through innerText).
+                    let setsLineIdx = -1;
+                    for (let i = 0; i < lines.length; i++) {
+                        if (/^Sets(\s|$)/.test(lines[i])) { setsLineIdx = i; break; }
+                    }
+
+                    let pointHome = null, pointAway = null;
+                    if (setsLineIdx > 0) {
+                        // Walk backwards collecting point tokens; expect the
+                        // two most-recent ones (ignoring blank lines) to be
+                        // away then home (reverse order).
+                        const ptRe = /^(0|15|30|40|AD|A)$/i;
+                        const collected = [];
+                        for (let i = setsLineIdx - 1; i >= 0 && collected.length < 2; i--) {
+                            const v = lines[i];
+                            if (!v) continue;
+                            if (ptRe.test(v)) collected.push(v.toUpperCase());
+                            else if (collected.length > 0) break;  // non-point before we got both
+                        }
+                        if (collected.length === 2) {
+                            // collected[0] = away (closer to table), collected[1] = home
+                            pointAway = collected[0];
+                            pointHome = collected[1];
                         }
                     }
 
@@ -726,8 +745,8 @@ async def extract_dafabet_scores(browser_context, entries: list[dict]) -> list[d
                         sets_home: setsHome,
                         sets_away: setsAway,
                         current_set: currentSet,
-                        score_rows: scoreRows,
-                        num_elements: allNums.length,
+                        game_scores: gameScores,
+                        table_found: tableFound,
                         point_home: pointHome,
                         point_away: pointAway,
                         page_text: text.substring(0, 800),
@@ -735,32 +754,28 @@ async def extract_dafabet_scores(browser_context, entries: list[dict]) -> list[d
                 }
             """)
 
-            entry["sets_home"] = score_info["sets_home"]
-            entry["sets_away"] = score_info["sets_away"]
+            entry["sets_home"]   = score_info["sets_home"]
+            entry["sets_away"]   = score_info["sets_away"]
             entry["current_set"] = score_info["current_set"]
-            entry["page_text"] = score_info.get("page_text", "")
+            entry["page_text"]   = score_info.get("page_text", "")
+            entry["game_scores"] = [tuple(gs) for gs in score_info.get("game_scores", [])]
 
             # Point score within current game
             ph = score_info.get("point_home")
             pa = score_info.get("point_away")
             entry["point_score"] = (ph, pa) if ph and pa else None
 
-            # Parse game scores per set from score_rows
-            # Typically two rows: player1 scores [6, 3] and player2 scores [4, 5]
-            game_scores = []
-            rows = score_info.get("score_rows", [])
-            if len(rows) >= 2:
-                p1_scores = rows[0]
-                p2_scores = rows[1]
-                n_sets = min(len(p1_scores), len(p2_scores))
-                for i in range(n_sets):
-                    game_scores.append((p1_scores[i], p2_scores[i]))
-
-            entry["game_scores"] = game_scores
+            if not score_info.get("table_found"):
+                # Scoreboard table missing (match just starting, or page
+                # still loading). Leave caller's downstream "implausible
+                # score" guard to suppress alerts rather than risk noise.
+                print(f"[delay] Dafabet scoreboard table missing for "
+                      f"{entry['home']} vs {entry['away']} — "
+                      f"will retry next cycle.")
 
             print(f"[delay] Dafabet score for {entry['home']} vs {entry['away']}: "
                   f"sets={entry['sets_home']}-{entry['sets_away']} "
-                  f"games={game_scores} set={entry['current_set']} "
+                  f"games={entry['game_scores']} set={entry['current_set']} "
                   f"points={entry.get('point_score', 'N/A')}")
 
         except Exception as exc:
