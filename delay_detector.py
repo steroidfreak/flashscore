@@ -255,15 +255,27 @@ async def fetch_flashscore_live(page) -> list[dict]:
     Navigate to flashscore.mobi LIVE tennis page and parse all live matches.
 
     Args:
-        page: Playwright page object (can be a dedicated tab)
+        page: Playwright page object (can be a dedicated, persistent tab)
 
     Returns:
         List of parsed match dicts from parse_flashscore_line()
         Each dict also gets a 'match_url' field for fetching point scores later.
     """
     try:
-        await page.goto(FLASHSCORE_LIVE_URL, wait_until="domcontentloaded", timeout=20_000)
-        await page.wait_for_timeout(2_000)
+        # Reuse already-loaded page when possible (saves a full navigation):
+        # if we're already on the live URL, just reload; otherwise goto once.
+        current_url = ""
+        try:
+            current_url = page.url or ""
+        except Exception:
+            current_url = ""
+
+        if FLASHSCORE_LIVE_URL in current_url:
+            await page.reload(wait_until="domcontentloaded", timeout=20_000)
+        else:
+            await page.goto(FLASHSCORE_LIVE_URL, wait_until="domcontentloaded", timeout=20_000)
+        # flashscore.mobi is a static HTML page — 1s is enough post-DOMContentLoaded
+        await page.wait_for_timeout(1_000)
 
         # Get match lines AND their URLs
         raw_data = await page.evaluate("""
@@ -799,6 +811,8 @@ async def check_score_delays(
     browser_context,
     dafabet_entries: list[dict],
     alerted_delays: set | None = None,
+    fs_page=None,
+    point_detail: bool = False,
 ) -> list[dict]:
     """
     Main delay detection function. Called once per polling cycle.
@@ -818,12 +832,16 @@ async def check_score_delays(
     if not dafabet_entries:
         return []
 
-    # Open a new tab for Flashscore
-    fs_page = await browser_context.new_page()
-    try:
+    # Prefer the persistent Flashscore tab when provided (lightweight path).
+    # Fall back to opening a throwaway tab only if no persistent page given.
+    if fs_page is not None:
         flashscore_matches = await fetch_flashscore_live(fs_page)
-    finally:
-        await fs_page.close()
+    else:
+        tmp_page = await browser_context.new_page()
+        try:
+            flashscore_matches = await fetch_flashscore_live(tmp_page)
+        finally:
+            await tmp_page.close()
 
     if not flashscore_matches:
         print("[delay] No live matches found on Flashscore.")
@@ -850,6 +868,30 @@ async def check_score_delays(
         dafa_sets = (dafa.get("sets_home", 0), dafa.get("sets_away", 0))
         dafa_points = dafa.get("point_score")  # ("30", "15") or None
 
+        # Guard: if Dafabet's scoreboard didn't populate (empty game_scores),
+        # we can't meaningfully compare. These produce "Games: [N/A]" alerts
+        # that are false positives — the Dafabet page just hadn't rendered
+        # yet or the scraper failed for this match. Skip silently. Matches
+        # the same guard used in `check_bwin_delays`.
+        if not dafa_games:
+            print(f"[delay] Skipping {dafa['home']} vs {dafa['away']} — "
+                  f"Dafabet game scores unavailable (N/A); cannot compare.")
+            continue
+        # Also reject implausible Dafabet states (same sanity floor as bwin).
+        if dafa_sets[0] > 5 or dafa_sets[1] > 5 or dafa_current > 5:
+            print(f"[delay] Skipping {dafa['home']} vs {dafa['away']} — "
+                  f"Dafabet score implausible (sets={dafa_sets}, "
+                  f"set={dafa_current}); likely parse error upstream.")
+            continue
+        if any(
+            (not isinstance(g, (tuple, list))) or len(g) < 2
+            or g[0] > 20 or g[1] > 20 or g[0] < 0 or g[1] < 0
+            for g in dafa_games
+        ):
+            print(f"[delay] Skipping {dafa['home']} vs {dafa['away']} — "
+                  f"Dafabet game scores implausible ({dafa_games}).")
+            continue
+
         # Get Flashscore data
         fs_current = fs_match["current_set"]
         fs_games = fs_match["game_scores"]  # [(g1,g2), ...] per set
@@ -860,9 +902,12 @@ async def check_score_delays(
         # Flashscore point scores from the match detail page
         da_cg_total = sum(_current_set_games(dafa_games))
         fs_cg_total = sum(_current_set_games(fs_games))
-        if (dafa_current == fs_current and da_cg_total == fs_cg_total
+        if (point_detail
+                and dafa_current == fs_current and da_cg_total == fs_cg_total
                 and dafa_points and not fs_points and fs_match.get("match_url")):
-            # Need to fetch point score from Flashscore match page
+            # Need to fetch point score from Flashscore match page.
+            # Gated behind point_detail flag because it opens an additional
+            # per-match tab (expensive on small hardware).
             await fetch_flashscore_point_scores(browser_context, [fs_match])
             fs_points = fs_match.get("point_score")
 
@@ -952,6 +997,7 @@ async def check_score_delays(
             f"<b>Name match:</b> {match_sim:.0%}\n\n"
             f"<b>Flashscore:</b> {fs_match['player1']} vs {fs_match['player2']}\n"
             f"<b>Dafabet link:</b> {dafa['url']}"
+            f"{chr(10) + '<b>Flashscore link:</b> ' + fs_match['match_url'] if fs_match.get('match_url') else ''}"
         )
 
         alerts.append({

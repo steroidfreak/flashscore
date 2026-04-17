@@ -133,6 +133,16 @@ MINIMAX_API_KEY: str = os.getenv("MINIMAX_API_KEY", "")
 # Enable score delay detection via Flashscore.mobi (default: true)
 DELAY_DETECTION: bool = os.getenv("DELAY_DETECTION", "true").lower() in ("1", "true", "yes")
 
+# Run the flashscore delay check only every Nth tennis cycle (default 2 =
+# every other cycle, i.e. ~2 min at the default 60s CHECK_INTERVAL).
+# Set to 1 to check every cycle, higher to save more CPU/network.
+DELAY_CHECK_INTERVAL: int = max(1, int(os.getenv("DELAY_CHECK_INTERVAL", "2")))
+
+# When True, open an extra per-match tab to fetch point-level scores from
+# Flashscore match-detail pages. Expensive — disabled by default. Set/Game
+# delays are the meaningful alerts; point-level rarely changes the verdict.
+FLASHSCORE_POINT_DETAIL: bool = os.getenv("FLASHSCORE_POINT_DETAIL", "false").lower() in ("1", "true", "yes")
+
 # Enable bwin cross-reference delay detection (default: true).
 # Opens a persistent tab on https://www.bwin.com/en/sports/live/tennis-5 and
 # uses bwin's WebSocket-pushed DOM as the reference clock. Alerts are fired
@@ -1124,10 +1134,36 @@ async def main() -> None:
                 print("[!] Continuing without bwin reference source.")
                 bwin_page = None
 
+        # ── Persistent Flashscore.mobi reference page ─────────────────
+        # Open ONE tab for flashscore.mobi and reuse it every delay check.
+        # Avoids new_page/goto/close churn that was ~2-3s of extra work
+        # and significant memory turnover every cycle on small hardware.
+        fs_page = None
+        if DELAY_DETECTION:
+            try:
+                fs_page = await context.new_page()
+                print(f"[*] Opening persistent Flashscore tab: {FLASHSCORE_LIVE_URL}")
+                await fs_page.goto(
+                    FLASHSCORE_LIVE_URL,
+                    wait_until="domcontentloaded",
+                    timeout=20_000,
+                )
+                await fs_page.wait_for_timeout(1_000)
+                print("[*] Flashscore reference page ready.\n")
+            except Exception as exc:
+                print(f"[!] Flashscore persistent page failed to open: {exc}")
+                print("[!] Falling back to per-cycle tab creation.")
+                fs_page = None
+
         print(f"[*] Starting multi-sport duplicate detector. Polling every {CHECK_INTERVAL}s (tennis).")
         print(f"[*] Tennis    threshold: {SIMILARITY_THRESHOLD}  |  Min per-side: {MIN_SIDE_SCORE}")
         print(f"[*] Heartbeat: every {HEARTBEAT_INTERVAL // 60}min")
-        print(f"[*] Delay detection: {'ON (flashscore.mobi)' if DELAY_DETECTION else 'OFF'}")
+        fs_mode = (
+            f"ON (persistent tab, every {DELAY_CHECK_INTERVAL} cycle(s), "
+            f"point_detail={'on' if FLASHSCORE_POINT_DETAIL else 'off'})"
+            if DELAY_DETECTION else "OFF"
+        )
+        print(f"[*] Delay detection: {fs_mode}")
         print(f"[*] bwin reference:  {'ON' if bwin_page else 'OFF'}")
         print(f"[*] Tennis URL:     {TENNIS_URL}")
         print(f"[*] Basketball:     {'ON' if BASK_ENABLED else 'OFF'}  ({BASKETBALL_URL})")
@@ -1181,7 +1217,9 @@ async def main() -> None:
             )))
 
         try:
+            cycle_count = 0
             while True:
+                cycle_count += 1
                 entries = await extract_matches(page, TENNIS_URL)
                 current_urls = {e["url"] for e in entries}
 
@@ -1331,11 +1369,22 @@ async def main() -> None:
                             print(f"[delay] extract_dafabet_scores failed: {exc}")
                             scored_entries = []
 
-                    if DELAY_DETECTION and scored_entries:
+                    # Throttle the Flashscore delay check: run only every Nth
+                    # cycle. `cycle_count` is the main-loop counter.
+                    run_fs_delay = (
+                        DELAY_DETECTION
+                        and scored_entries
+                        and (cycle_count % DELAY_CHECK_INTERVAL == 0)
+                    )
+                    if run_fs_delay:
                         try:
                             # Compare against Flashscore.mobi (sets, games, points)
                             delay_alerts = await check_score_delays(
-                                context, scored_entries, alerted_delays
+                                context,
+                                scored_entries,
+                                alerted_delays,
+                                fs_page=fs_page,
+                                point_detail=FLASHSCORE_POINT_DETAIL,
                             )
 
                             for da in delay_alerts:
@@ -1417,7 +1466,7 @@ async def main() -> None:
                 f"🔴 <b>Multi-sport duplicate monitor stopped</b>\n"
                 f"Stopped at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
             )
-            for p in (bwin_page, bask_page, voll_page):
+            for p in (fs_page, bwin_page, bask_page, voll_page):
                 if p is not None:
                     try:
                         await p.close()
