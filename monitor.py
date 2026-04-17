@@ -139,8 +139,8 @@ DELAY_DETECTION: bool = os.getenv("DELAY_DETECTION", "true").lower() in ("1", "t
 # only after a lag is observed on two consecutive polling cycles.
 BWIN_DELAY_DETECTION: bool = os.getenv("BWIN_DELAY_DETECTION", "true").lower() in ("1", "true", "yes")
 
-# Heartbeat interval in seconds (default: 3600 = every hour)
-HEARTBEAT_INTERVAL: int = int(os.getenv("HEARTBEAT_INTERVAL", "3600"))
+# Heartbeat interval in seconds (default: 14400 = every 4 hours)
+HEARTBEAT_INTERVAL: int = int(os.getenv("HEARTBEAT_INTERVAL", "14400"))
 
 # Tennis live page URL
 TENNIS_URL: str = "https://sports.dafabet.com/en/live/sport/239-TENN"
