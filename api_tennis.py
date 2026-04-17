@@ -63,38 +63,68 @@ async def fetch_livescore(timezone: str = "UTC") -> list[dict]:
     return data.get("result", [])
 
 
+def _parse_set_scores(pointbypoint: list[dict]) -> dict[str, str]:
+    """
+    Extract the latest game score per set from pointbypoint data.
+    Returns e.g. {"Set 1": "6-4", "Set 2": "3-2"}
+    """
+    set_scores: dict[str, str] = {}
+    for game in pointbypoint:
+        set_name = game.get("set_number", "")
+        score    = game.get("score", "")
+        if set_name and score:
+            set_scores[set_name] = score.replace(" ", "")  # "4 - 3" → "4-3"
+    return set_scores
+
+
 def print_matches(matches: list[dict]) -> None:
     """Pretty-print live matches to stdout."""
     if not matches:
         print("No live matches right now.")
         return
 
+    # Separate live vs finished
+    live     = [m for m in matches if m.get("event_status", "") != "Finished"]
+    finished = [m for m in matches if m.get("event_status", "") == "Finished"]
+
     print(f"\n{'='*60}")
-    print(f"  API-TENNIS LIVE SCORES  ({len(matches)} match(es))")
+    print(f"  API-TENNIS LIVE SCORES")
+    print(f"  {len(live)} live  |  {len(finished)} just finished  |  {len(matches)} total")
     print(f"{'='*60}")
 
-    for m in matches:
-        home  = m.get("event_first_player",  "?")
-        away  = m.get("event_second_player", "?")
-        score = m.get("event_score",         "?")
-        serve = m.get("event_serve",         "")
-        sets  = m.get("event_sets",          [])
-        tourn = m.get("tournament_name",     "")
-        status = m.get("event_status",       "")
+    for m in live + finished:
+        home   = m.get("event_first_player",  "?")
+        away   = m.get("event_second_player", "?")
+        sets   = m.get("event_final_result",  "-")   # sets won  e.g. "1 - 0"
+        game   = m.get("event_game_result",   "-")   # points    e.g. "40 - 15"
+        serve  = m.get("event_serve",         "")    # "First Player" / "Second Player" / null
+        status = m.get("event_status",        "")    # "Set 1", "Finished" etc.
+        tourn  = m.get("tournament_name",     "")
+        round_ = m.get("tournament_round",    "")
+        pbp    = m.get("pointbypoint",        [])
 
-        # Build per-set breakdown
-        set_str = ""
-        if isinstance(sets, list):
-            set_str = "  |  " + "  ".join(
-                f"S{i+1}: {s.get('score_first','?')}-{s.get('score_second','?')}"
-                for i, s in enumerate(sets)
-            )
+        # Per-set game scores from pointbypoint
+        set_scores = _parse_set_scores(pbp)
+        set_str = "  ".join(
+            f"{k}: {v}" for k, v in set_scores.items()
+        )
 
-        serve_indicator = f"  ({'*' if serve == 'home' else ' '}{home[:3]} serving)" if serve else ""
+        # Serve indicator
+        if serve == "First Player":
+            serve_str = f"  * {home.split('/')[0].strip()} serving"
+        elif serve == "Second Player":
+            serve_str = f"  * {away.split('/')[0].strip()} serving"
+        else:
+            serve_str = ""
+
+        # Status tag
+        tag = "[FINISHED]" if status == "Finished" else f"[LIVE]  {status}"
 
         print(f"\n  {home}  vs  {away}")
-        print(f"  Score: {score}{set_str}")
-        print(f"  Status: {status}  |  Tournament: {tourn}{serve_indicator}")
+        print(f"  Sets: {sets}  |  Game: {game}{serve_str}")
+        if set_str:
+            print(f"  Progress: {set_str}")
+        print(f"  {tag}  |  {tourn}  ({round_})")
 
     print(f"\n{'='*60}\n")
 
