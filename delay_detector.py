@@ -562,6 +562,20 @@ def detect_delay(
     # ── Set-level delay ──
     set_diff = flashscore_current_set - dafabet_current_set
     if set_diff >= 1:
+        # False-positive guard: Dafabet often lags a few seconds when
+        # rendering the header of a brand-new set. If Flashscore's new set
+        # is still 0-0 (no games played yet) AND both sides agree on the
+        # sets-won tally, this is just a display lag — not a real delay.
+        # Real delay example:
+        #   Dafa [7-6]            FS [7-6, 0-1]   ← game has been played
+        # Display-lag example (skip):
+        #   Dafa [7-6]            FS [7-6, 0-0]   ← new set, still empty
+        fs_new_set = _current_set_games(flashscore_games)
+        if (
+            fs_new_set == (0, 0)
+            and tuple(dafabet_sets_won) == tuple(flashscore_sets_won)
+        ):
+            return None
         return {
             "type": "SET_DELAY",
             "set_diff": set_diff,
