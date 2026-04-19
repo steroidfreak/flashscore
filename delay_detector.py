@@ -525,6 +525,13 @@ GAME_DELAY_THRESHOLD: int = 2  # e.g. Flashscore 5-3 vs Dafabet 3-2 = 3 games ah
 # A diff of 2 means e.g. Flashscore at 40-0 (value 3) vs Dafabet at 15-0 (value 1)
 POINT_DELAY_THRESHOLD: int = 2
 
+# Minimum games played in Flashscore's NEW set before we fire a SET_DELAY.
+# Dafabet commonly trails by ~10-60s when rendering the header of a new set;
+# by the time a human clicks the link, the two pages already agree. Require
+# the new set to have advanced by at least N games so the window stays open
+# long enough to verify. Set to 0 to restore old behaviour.
+SET_DELAY_MIN_NEW_SET_GAMES: int = 3
+
 
 def _total_games(game_scores: list[tuple]) -> int:
     """Sum all games played across all sets."""
@@ -562,19 +569,17 @@ def detect_delay(
     # ── Set-level delay ──
     set_diff = flashscore_current_set - dafabet_current_set
     if set_diff >= 1:
-        # False-positive guard: Dafabet often lags a few seconds when
-        # rendering the header of a brand-new set. If Flashscore's new set
-        # is still 0-0 (no games played yet) AND both sides agree on the
-        # sets-won tally, this is just a display lag — not a real delay.
-        # Real delay example:
-        #   Dafa [7-6]            FS [7-6, 0-1]   ← game has been played
-        # Display-lag example (skip):
-        #   Dafa [7-6]            FS [7-6, 0-0]   ← new set, still empty
+        # False-positive guard: Dafabet often lags 10-60s when rendering
+        # the header of a brand-new set. In practice the user can't click
+        # the alert fast enough to actually see a discrepancy. Require
+        # Flashscore's new set to have advanced by at least
+        # SET_DELAY_MIN_NEW_SET_GAMES games (default 3) before firing.
+        #   Dafa [7-6]  FS [7-6, 0-0]  → skip (0 games into new set)
+        #   Dafa [7-6]  FS [7-6, 0-1]  → skip (1 game, still too short)
+        #   Dafa [7-6]  FS [7-6, 2-1]  → alert (3 games into new set)
         fs_new_set = _current_set_games(flashscore_games)
-        if (
-            fs_new_set == (0, 0)
-            and tuple(dafabet_sets_won) == tuple(flashscore_sets_won)
-        ):
+        fs_new_set_games_played = fs_new_set[0] + fs_new_set[1]
+        if fs_new_set_games_played < SET_DELAY_MIN_NEW_SET_GAMES:
             return None
         return {
             "type": "SET_DELAY",
@@ -939,6 +944,21 @@ async def check_score_delays(
 
         if not delay:
             continue
+
+        # For SET_DELAY specifically, require a high-confidence name match.
+        # The loose 0.55 threshold used for pairing lets through wrong-player
+        # matches (e.g. "Brockmann, T" paired with "balestrieri a." at 55%),
+        # which would otherwise generate ghost alerts.
+        if delay["type"] == "SET_DELAY":
+            sim_h1 = cross_platform_player_similarity(dafa["home"], fs_match["player1"])
+            sim_a2 = cross_platform_player_similarity(dafa["away"], fs_match["player2"])
+            sim_h2 = cross_platform_player_similarity(dafa["home"], fs_match["player2"])
+            sim_a1 = cross_platform_player_similarity(dafa["away"], fs_match["player1"])
+            best_pair_sim = max((sim_h1 + sim_a2) / 2, (sim_h2 + sim_a1) / 2)
+            if best_pair_sim < 0.75:
+                print(f"[delay] Skipping SET_DELAY for {dafa['home']} vs {dafa['away']} "
+                      f"— low name match ({best_pair_sim:.0%})")
+                continue
 
         # Build alert key — include delay type + current scores to avoid re-alerting
         # but RE-alert if the delay grows
