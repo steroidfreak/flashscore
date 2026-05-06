@@ -10,6 +10,33 @@ Match B: Butvilas, E        vs  Imamura, M
 
 ---
 
+## One-shot Linux install (copy-paste)
+
+Tested on Ubuntu 22.04 / 24.04 (Debian-based). Run as root or with `sudo`:
+
+```bash
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv git && \
+git clone https://github.com/steroidfreak/tennis-duplicate.git && \
+cd tennis-duplicate && \
+python3 -m venv venv && source venv/bin/activate && \
+pip install -r requirements.txt && \
+playwright install chromium && \
+playwright install-deps chromium && \
+cp .env.example .env && \
+echo "" && echo "✅ Install done. Now edit .env with your credentials:" && \
+echo "   nano .env" && \
+echo "Then start the monitor with:" && \
+echo "   source venv/bin/activate && python monitor.py"
+```
+
+After editing `.env` (Telegram + MiniMax keys), launch:
+
+```bash
+source venv/bin/activate && python monitor.py
+```
+
+---
+
 ## Features
 
 - Expands all collapsed league/group sections automatically
@@ -26,7 +53,7 @@ Match B: Butvilas, E        vs  Imamura, M
 ## Project structure
 
 ```
-flashscore/
+tennis-duplicate/
 ├── monitor.py        # main script
 ├── requirements.txt  # Python dependencies
 ├── .env.example      # credential template (copy to .env and fill in)
@@ -47,8 +74,8 @@ flashscore/
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/steroidfreak/flashscore.git
-cd flashscore
+git clone https://github.com/steroidfreak/tennis-duplicate.git
+cd tennis-duplicate
 
 # 2. Install Python dependencies
 pip install -r requirements.txt
@@ -137,8 +164,8 @@ apt install -y python3 python3-pip python3-venv git
 #### 4. Clone the repo
 
 ```bash
-git clone https://github.com/steroidfreak/flashscore.git
-cd flashscore
+git clone https://github.com/steroidfreak/tennis-duplicate.git
+cd tennis-duplicate
 ```
 
 #### 5. Set up a Python virtual environment
@@ -224,9 +251,9 @@ Wants=network-online.target
 
 [Service]
 User=root
-WorkingDirectory=/root/flashscore
-EnvironmentFile=/root/flashscore/.env
-ExecStart=/root/flashscore/venv/bin/python monitor.py
+WorkingDirectory=/root/tennis-duplicate
+EnvironmentFile=/root/tennis-duplicate/.env
+ExecStart=/root/tennis-duplicate/venv/bin/python monitor.py
 Restart=always
 RestartSec=30
 StandardOutput=journal
@@ -275,8 +302,8 @@ apt install -y screen
 screen -S monitor
 
 # Activate venv and run
-source /root/flashscore/venv/bin/activate
-cd /root/flashscore
+source /root/tennis-duplicate/venv/bin/activate
+cd /root/tennis-duplicate
 python monitor.py
 
 # Detach (monitor keeps running): Ctrl+A, then D
@@ -290,7 +317,7 @@ screen -r monitor
 ### Updating the bot
 
 ```bash
-cd /root/flashscore
+cd /root/tennis-duplicate
 git pull                           # get latest code
 source venv/bin/activate
 pip install -r requirements.txt    # in case dependencies changed
