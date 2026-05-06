@@ -268,8 +268,6 @@ async def extract_team_matches(page: Page, url: str) -> list[dict]:
             for (const link of document.querySelectorAll('a[href]')) {
                 const href = link.href.split('?')[0];
                 if (!matchRe.test(new URL(link.href).pathname)) continue;
-                if (seen.has(href)) continue;
-                seen.add(href);
 
                 let section = "";
                 let secEl = link.parentElement;
@@ -289,6 +287,13 @@ async def extract_team_matches(page: Page, url: str) -> list[dict]:
                     }
                     secEl = secEl.parentElement;
                 }
+
+                // Dedup by (href, section): same match URL listed under two
+                // different tournament sections is a real duplicate we want
+                // to surface, not silently collapse.
+                const dedupKey = href + '|' + section;
+                if (seen.has(dedupKey)) continue;
+                seen.add(dedupKey);
 
                 let container = link.parentElement;
                 let found = false;
